@@ -16,13 +16,13 @@ A full-featured Lorebook / World Info extension for [oobabooga's text-generation
 
 ## Installation
 
-1. Clone or copy this repository into your `text-generation-webui/extensions/` folder:
+1. Clone or copy this repository into your `text-generation-webui/user_data/extensions/` folder:
    ```
-   text-generation-webui/
-   └── extensions/
-       └── lorebook/
+   text-generation-webui
+   └── user_data
+       └── extensions
            ├── script.py
-           └── lorebooks/   ← created automatically on first run
+           └── lorebooks   ← created automatically on first run
    ```
 
 2. Launch oobabooga with `--extensions lorebook` or enable it from the **Extensions** tab in the UI.
