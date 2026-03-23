@@ -3,6 +3,23 @@
 A full-featured Lorebook / World Info extension for [oobabooga's text-generation-web-ui](https://github.com/oobabooga/text-generation-webui). Adds dynamic, keyword-triggered context injection across **instruct mode, chat mode, chat-instruct mode, and text completion (notebook) mode** — with a built-in GUI editor, SillyTavern import/export, mid-generation interrupts, recursive scanning, and persistent settings.
 
 ---
+## Quick Start
+
+1. Open the **Lorebook** tab and click **New** to create a lorebook.
+2. Give it a name and click **Save**.
+3. Open the **Entries** accordion and click **+ Add** to create your first entry.
+4. Fill in **Trigger words** and **Content**, then click **Save entry**.
+5. In the right panel's **Lorebooks** tab, check the checkbox next to your lorebook to activate it.
+6. Start a generation — matching keywords in the conversation will inject your world info automatically.
+
+---
+
+## Compatibility
+
+- Tested with oobabooga's text-generation-web-ui.
+- Tested by  importing silly tavern lorebooks.
+  
+---
 
 ## Features
 
@@ -161,23 +178,5 @@ Full round-trip compatibility with SillyTavern world-info files.
 2. Launch oobabooga with `--extensions lorebook` or enable it from the **Extensions** tab in the UI.
 
 3. A **Lorebook** tab will appear in the interface.
-
----
-
-## Quick Start
-
-1. Open the **Lorebook** tab and click **New** to create a lorebook.
-2. Give it a name and click **Save**.
-3. Open the **Entries** accordion and click **+ Add** to create your first entry.
-4. Fill in **Trigger words** and **Content**, then click **Save entry**.
-5. In the right panel's **Lorebooks** tab, check the checkbox next to your lorebook to activate it.
-6. Start a generation — matching keywords in the conversation will inject your world info automatically.
-
----
-
-## Compatibility
-
-- Tested with oobabooga's text-generation-web-ui.
-- Works with HuggingFace transformers, llama.cpp (via `LlamaServer`), ExLlamaV2 (`Exllamav3Model`), and TensorRT-LLM backends.
 - Mid-generation interrupt requires streaming mode to be active in generation settings.
 - SillyTavern world-info `.json` files are directly importable without modification.
