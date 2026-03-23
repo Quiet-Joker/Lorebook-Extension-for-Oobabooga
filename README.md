@@ -14,6 +14,25 @@ A full-featured Lorebook / World Info extension for [oobabooga's text-generation
 
 ---
 
+## Installation
+
+1. Clone or copy this repository into your `text-generation-webui/extensions/` folder:
+   ```
+   text-generation-webui/
+   └── extensions/
+       └── lorebook/
+           ├── script.py
+           └── lorebooks/   ← created automatically on first run
+   ```
+
+2. Launch oobabooga with `--extensions lorebook` or enable it from the **Extensions** tab in the UI.
+
+3. A **Lorebook** tab will appear in the interface.
+- Mid-generation interrupt requires streaming mode to be active in generation settings.
+- SillyTavern world-info `.json` files are directly importable without modification.
+  
+---
+
 ## Compatibility
 
 - Tested with oobabooga's text-generation-web-ui.
@@ -161,22 +180,3 @@ Full round-trip compatibility with SillyTavern world-info files.
 | Mid-gen interrupt | Off | Monitor streamed output for new triggers. |
 | Max interrupts per reply | 3 | How many times a single reply can be interrupted. |
 | Context position override | Off | Force all entries to one position. |
-
----
-
-## Installation
-
-1. Clone or copy this repository into your `text-generation-webui/extensions/` folder:
-   ```
-   text-generation-webui/
-   └── extensions/
-       └── lorebook/
-           ├── script.py
-           └── lorebooks/   ← created automatically on first run
-   ```
-
-2. Launch oobabooga with `--extensions lorebook` or enable it from the **Extensions** tab in the UI.
-
-3. A **Lorebook** tab will appear in the interface.
-- Mid-generation interrupt requires streaming mode to be active in generation settings.
-- SillyTavern world-info `.json` files are directly importable without modification.
