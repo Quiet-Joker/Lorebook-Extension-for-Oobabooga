@@ -21,8 +21,9 @@ A full-featured Lorebook / World Info extension for [oobabooga's text-generation
    text-generation-webui
    └── user_data
        └── extensions
-           ├── script.py
-           └── lorebooks   ← created automatically on first run
+           └── lorebook
+               ├── script.py
+               └── lorebooks   ← created automatically on first run
    ```
 
 2. Launch oobabooga with `--extensions lorebook` or enable it from the **Extensions** tab in the UI.
