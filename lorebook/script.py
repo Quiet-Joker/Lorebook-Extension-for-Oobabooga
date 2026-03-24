@@ -512,11 +512,17 @@ def _find_active_matches(current_text, history_msgs):
             matched_list.append(e)
 
     matched_list = _apply_inclusion_groups(matched_list)
-    matched_list.sort(key=lambda e: e.get("priority", 0), reverse=True)
+    # Sort by priority DESC; for ties use reverse discovery order so the last-triggered
+    # entry comes first into _trim_to_budget (gets the most budget) and ends up freshest
+    # (closest to reply) after the final reversal.  enumerate gives each entry its stable
+    # discovery index; negating it puts later-discovered entries first on ties.
+    matched_list = [e for _, e in sorted(
+        enumerate(matched_list),
+        key=lambda pair: (pair[1].get("priority", 0), pair[0]),
+        reverse=True,
+    )]
     trimmed = _trim_to_budget(matched_list)
-    # Reverse so highest-priority entry is injected last = closest to reply (freshest).
-    # _trim_to_budget already consumed the budget in priority order (highest first),
-    # so the reversal only affects injection order, not which entries survive the cut.
+    # Reverse so highest-priority / last-activated entry ends up closest to reply (freshest).
     return list(reversed(trimmed)), matched_list
 
 
@@ -703,6 +709,13 @@ def _find_new_trigger_entries(text, already_injected, notebook=False):
     # FIX #8: Apply inclusion group filtering here too, consistent with _find_active_matches.
     # Without this, two entries from the same group could both fire mid-generation.
     newly = _apply_inclusion_groups(newly)
+    # Apply the same (priority DESC, reverse-discovery) sort so equal-priority entries
+    # triggered later during generation end up freshest after budget trimming + reversal.
+    newly = [e for _, e in sorted(
+        enumerate(newly),
+        key=lambda pair: (pair[1].get("priority", 0), pair[0]),
+        reverse=True,
+    )]
     return _trim_to_budget(newly)
 
 
@@ -713,7 +726,14 @@ def _replace_world_info_block(prompt, all_entries):
     if not pref or not suf:
         return prompt, []
 
-    trimmed = list(reversed(_trim_to_budget(sorted(all_entries, key=lambda e: e.get("priority", 0), reverse=True))))
+    # Sort by priority DESC; for ties, later position in all_entries = more recently triggered
+    # = should be freshest.  Negate the index so later entries sort first (get most budget),
+    # then reverse at the end so they end up last (freshest) in injection order.
+    trimmed = list(reversed(_trim_to_budget([e for _, e in sorted(
+        enumerate(all_entries),
+        key=lambda pair: (pair[1].get("priority", 0), pair[0]),
+        reverse=True,
+    )])))
     before_entries       = [e for e in trimmed if _eff_pos(e) == "before_context"]
     after_entries        = [e for e in trimmed if _eff_pos(e) == "after_context"]
     before_reply_entries = [e for e in trimmed if _eff_pos(e) == "before_reply"]
@@ -787,7 +807,7 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
         label = e.get("comment", "") or ", ".join(e.get("keys", []))[:30] or f"UID {e.get('uid')}"
         toks = _count_tokens(e.get("content", ""))
         total_tokens += toks
-        rows.append((label, toks))
+        rows.append((label, toks, e.get("priority", 0)))
         labels_this_turn.add(label)
 
     # Choose the correct session sets for this path.
@@ -796,14 +816,14 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
 
     # Classify each entry relative to previous turns.
     entry_records = []
-    for label, tokens in rows:
+    for label, tokens, priority in rows:
         if label not in all_labels:
-            status = "new"         # never fired before this session
+            status = "new"
         elif label in prev_labels:
-            status = "repeat"      # fired last turn too
+            status = "repeat"
         else:
-            status = "returned"    # fired before but skipped at least one turn
-        entry_records.append({"label": label, "tokens": tokens, "status": status})
+            status = "returned"
+        entry_records.append({"label": label, "tokens": tokens, "status": status, "priority": priority})
 
     # Entries that triggered keywords but were cut by the token budget.
     budget_dropped_records = []
@@ -814,7 +834,7 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
             if label in injected_labels:
                 continue  # made it in — don't double-count
             tokens = _count_tokens(e.get("content", ""))
-            budget_dropped_records.append({"label": label, "tokens": tokens, "status": "budget_dropped"})
+            budget_dropped_records.append({"label": label, "tokens": tokens, "status": "budget_dropped", "priority": e.get("priority", 0)})
 
     # Entries present last turn that are gone this turn (keyword no longer matches).
     dropped = [lbl for lbl in prev_labels if lbl not in labels_this_turn]
@@ -893,7 +913,11 @@ def _find_notebook_matches(question_text):
             matched.append(e)
 
     matched = _apply_inclusion_groups(matched)
-    matched.sort(key=lambda e: e.get("priority", 0), reverse=True)
+    matched = [e for _, e in sorted(
+        enumerate(matched),
+        key=lambda pair: (pair[1].get("priority", 0), pair[0]),
+        reverse=True,
+    )]
     trimmed = _trim_to_budget(matched)
     return list(reversed(trimmed)), matched
 
@@ -1226,6 +1250,10 @@ def _build_history_html(notebook=False):
             else:
                 pos = f"#{i + 1}"
 
+            prio_val = e.get("priority", 0)
+            prio_badge = (f'<span style="font-size:10px;padding:1px 6px;border-radius:10px;'
+                          f'background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.35);'
+                          f'color:var(--body-text-color-subdued);white-space:nowrap">p{prio_val}</span>')
             em, bg, bc, tc = _S.get(e["status"], _S["repeat"])
             badge = (f'<span style="font-size:10px;padding:1px 7px;border-radius:10px;'
                      f'background:{bg};border:1px solid {bc};color:{tc};white-space:nowrap">'
@@ -1235,6 +1263,7 @@ def _build_history_html(notebook=False):
                 f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued);'
                 f'white-space:nowrap;vertical-align:middle">{pos}</td>'
                 f'<td style="padding:4px 8px;font-size:12px;vertical-align:middle">{e["label"]}</td>'
+                f'<td style="padding:4px 8px;text-align:center;vertical-align:middle">{prio_badge}</td>'
                 f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued);'
                 f'text-align:right;white-space:nowrap;vertical-align:middle">~{e["tokens"]} tok</td>'
                 f'<td style="padding:4px 8px;text-align:right;vertical-align:middle">{badge}</td>'
@@ -1243,6 +1272,10 @@ def _build_history_html(notebook=False):
 
         # ── budget-cut rows (triggered keyword but didn't fit in the token budget) ──
         for e in budget_dropped:
+            prio_val = e.get("priority", 0)
+            prio_badge = (f'<span style="font-size:10px;padding:1px 6px;border-radius:10px;'
+                          f'background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.35);'
+                          f'color:var(--body-text-color-subdued);white-space:nowrap">p{prio_val}</span>')
             em, bg, bc, tc = _S["budget_dropped"]
             badge = (f'<span style="font-size:10px;padding:1px 7px;border-radius:10px;'
                      f'background:{bg};border:1px solid {bc};color:{tc};white-space:nowrap">'
@@ -1251,6 +1284,7 @@ def _build_history_html(notebook=False):
                 f'<tr style="opacity:.55;border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.06))">'
                 f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued)">—</td>'
                 f'<td style="padding:4px 8px;font-size:12px;font-style:italic">{e["label"]}</td>'
+                f'<td style="padding:4px 8px;text-align:center">{prio_badge}</td>'
                 f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued);'
                 f'text-align:right;white-space:nowrap">~{e["tokens"]} tok</td>'
                 f'<td style="padding:4px 8px;text-align:right">{badge}</td>'
@@ -1263,6 +1297,7 @@ def _build_history_html(notebook=False):
                 f'<tr style="opacity:.40;border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.06))">'
                 f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued)">—</td>'
                 f'<td style="padding:4px 8px;font-size:12px;text-decoration:line-through">{lbl}</td>'
+                f'<td style="padding:4px 8px"></td>'
                 f'<td style="padding:4px 8px"></td>'
                 f'<td style="padding:4px 8px;text-align:right">'
                 f'<span style="font-size:10px;padding:1px 7px;border-radius:10px;'
@@ -1856,8 +1891,8 @@ def ui():
             table_md = "*No injection recorded yet — send a message first.*"
         else:
             total = len(info["entries"])
-            lines = ["| # | Entry | Est. tokens |", "|---|-------|-------------|"]
-            for i, (label, toks) in enumerate(info["entries"]):
+            lines = ["| # | Entry | Pri | Tokens |", "|---|-------|-----|--------|"]
+            for i, (label, toks, prio) in enumerate(info["entries"]):
                 if total == 1:
                     pos = "#1"
                 elif i == 0:
@@ -1866,7 +1901,7 @@ def ui():
                     pos = f"#{total} *(freshest)*"
                 else:
                     pos = f"#{i + 1}"
-                lines.append(f"| {pos} | {label} | {toks} |")
+                lines.append(f"| {pos} | {label} | p{prio} | {toks} |")
             lines.append(f"\n**Total: ~{info['total_tokens']} tokens** | **Interrupts: {info['interrupts']}**")
             table_md = "\n".join(lines)
         return gr.update(value=table_md), gr.update(value=_build_history_html(notebook=False))
@@ -1878,8 +1913,8 @@ def ui():
             table_md = "*No injection recorded yet — use the Notebook tab first.*"
         else:
             total = len(info["entries"])
-            lines = ["| # | Entry | Est. tokens |", "|---|-------|-------------|"]
-            for i, (label, toks) in enumerate(info["entries"]):
+            lines = ["| # | Entry | Pri | Tokens |", "|---|-------|-----|--------|"]
+            for i, (label, toks, prio) in enumerate(info["entries"]):
                 if total == 1:
                     pos = "#1"
                 elif i == 0:
@@ -1888,7 +1923,7 @@ def ui():
                     pos = f"#{total} *(freshest)*"
                 else:
                     pos = f"#{i + 1}"
-                lines.append(f"| {pos} | {label} | {toks} |")
+                lines.append(f"| {pos} | {label} | p{prio} | {toks} |")
             lines.append(f"\n**Total: ~{info['total_tokens']} tokens**")
             table_md = "\n".join(lines)
         return gr.update(value=table_md), gr.update(value=_build_history_html(notebook=True))
