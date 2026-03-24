@@ -613,7 +613,16 @@ def state_modifier(state):
     last_user = internal[-1][0]
     if not last_user or last_user == "<|BEGIN-VISIBLE-CHAT|>":
         return state
-    _do_wi_injection(last_user, state[_HIST_MSGS], state)  # result unused; preview written in custom_generate_reply
+    # FIX: On regenerate, chat_input_modifier never runs, so _lb_chat_matched /
+    # _lb_chat_all_matched are never written to state.  The mid_gen ON path in
+    # custom_generate_reply reads _cur_injected directly and is unaffected, but
+    # the mid_gen OFF early-return path reads state["_lb_chat_matched"] and
+    # gets [] every time — so the history showed nothing even when entries fired.
+    # Store the results here, mirroring what chat_input_modifier does on normal
+    # sends, so custom_generate_reply always has the data it needs.
+    _regen_matched, _regen_all = _do_wi_injection(last_user, state[_HIST_MSGS], state)
+    state["_lb_chat_matched"]     = _regen_matched or []
+    state["_lb_chat_all_matched"] = _regen_all     or []
     return state
 
 
