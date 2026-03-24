@@ -8,6 +8,16 @@ from pathlib import Path
 
 import gradio as gr
 
+
+def _count_tokens(text):
+    """Count tokens using the loaded model's tokenizer.
+    Falls back to a char-based estimate if the model isn't loaded yet."""
+    try:
+        from modules.text_generation import get_encoded_length
+        return get_encoded_length(text)
+    except Exception:
+        return max(1, len(text) // 4)
+
 params = {
     "activate": True,
     "is_tab": True,
@@ -22,7 +32,6 @@ params = {
     "max_recursion_steps": 3,
     "mid_gen_interrupt": False,
     "max_interrupts": 3,
-    "chars_per_token": 4,
     "position_override_enabled": False,
     "position_override_value": "after_context",
     "chat_only_scan": False,
@@ -40,7 +49,7 @@ LOREBOOKS_DIR.mkdir(parents=True, exist_ok=True)
 _PARAMS_PERSIST_KEYS = {
     "activate", "scan_depth", "token_budget", "injection_prefix", "injection_suffix",
     "constant_entries", "recursive_scan", "max_recursion_steps", "mid_gen_interrupt",
-    "max_interrupts", "chars_per_token", "position_override_enabled", "position_override_value",
+    "max_interrupts", "position_override_enabled", "position_override_value",
     "chat_only_scan",
 }
 
@@ -395,13 +404,13 @@ def _apply_inclusion_groups(matched):
 
 
 def _trim_to_budget(entries):
-    budget_chars = int(params["token_budget"] * params["chars_per_token"])
+    budget_tokens = int(params["token_budget"])
     kept, used = [], 0
     for e in entries:
-        remaining = budget_chars - used
+        remaining = budget_tokens - used
         if remaining <= 0:
             break
-        size = len(e.get("content", ""))
+        size = _count_tokens(e.get("content", ""))
         if size <= remaining:
             kept.append(e)
             used += size
@@ -771,17 +780,15 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
     global _chat_turn_counter, _notebook_turn_counter
 
     rows = []
-    total_chars = 0
+    total_tokens = 0
     labels_this_turn: set = set()
 
     for e in all_fired:
-        chars = len(e.get("content", ""))
-        total_chars += chars
         label = e.get("comment", "") or ", ".join(e.get("keys", []))[:30] or f"UID {e.get('uid')}"
-        rows.append((label, chars // params["chars_per_token"] if chars else 0))
+        toks = _count_tokens(e.get("content", ""))
+        total_tokens += toks
+        rows.append((label, toks))
         labels_this_turn.add(label)
-
-    total_tokens = total_chars // params["chars_per_token"] if total_chars else 0
 
     # Choose the correct session sets for this path.
     prev_labels = _prev_notebook_labels if notebook else _prev_chat_labels
@@ -806,8 +813,7 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
             label = e.get("comment", "") or ", ".join(e.get("keys", []))[:30] or f"UID {e.get('uid')}"
             if label in injected_labels:
                 continue  # made it in — don't double-count
-            chars = len(e.get("content", ""))
-            tokens = chars // params["chars_per_token"] if chars else 0
+            tokens = _count_tokens(e.get("content", ""))
             budget_dropped_records.append({"label": label, "tokens": tokens, "status": "budget_dropped"})
 
     # Entries present last turn that are gone this turn (keyword no longer matches).
@@ -1454,8 +1460,6 @@ def ui():
                                                    info="Max world info tokens to inject per turn.")
 
                     with gr.Row():
-                        chars_per_token_n = gr.Number(label="Chars per token",    value=params["chars_per_token"], step=0.5, minimum=1, maximum=8,
-                                                      info="For budget estimation. 4 is a safe default.")
                         max_recursion_n   = gr.Number(label="Max recursion steps", value=params["max_recursion_steps"], step=1, minimum=1, maximum=10,
                                                       info="Caps recursive passes to prevent infinite loops.")
 
@@ -2009,7 +2013,6 @@ def ui():
     activate_cb.change(         _set_activate,                                                          [activate_cb],          [stats_html])
     scan_depth_n.change(        lambda x: _safe_int("scan_depth",          x),                         [scan_depth_n],         None)
     token_budget_n.change(      lambda x: _safe_int("token_budget",        x),                         [token_budget_n],       None)
-    chars_per_token_n.change(   lambda x: _safe_float("chars_per_token",   x),                         [chars_per_token_n],    None)
     constant_entries_cb.change( lambda x: _set_param("constant_entries",       x),                     [constant_entries_cb],  None)
     recursive_scan_cb.change(   lambda x: _set_param("recursive_scan",         x),                     [recursive_scan_cb],    None)
     chat_only_scan_cb.change(   lambda x: _set_param("chat_only_scan",         x),                     [chat_only_scan_cb],    None)
