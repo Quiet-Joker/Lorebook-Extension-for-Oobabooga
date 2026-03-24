@@ -55,6 +55,22 @@ _HIST_MSGS = "_lb_hist_msgs"
 _last_injection_lock = threading.Lock()
 _last_injection_info: dict = {"entries": [], "interrupts": 0, "total_tokens": 0}
 
+_last_notebook_injection_lock = threading.Lock()
+_last_notebook_injection_info: dict = {"entries": [], "interrupts": 0, "total_tokens": 0}
+
+# Per-session injection history (newest first, capped at 60 turns each).
+# Tracks new / repeat / returned / dropped status across turns so the UI
+# can show a full audit trail of what fired and when.
+_injection_history_lock = threading.Lock()
+_injection_history: list = []           # chat / instruct
+_injection_history_notebook: list = []  # notebook
+_prev_chat_labels: set = set()          # labels fired last chat turn
+_prev_notebook_labels: set = set()
+_all_chat_labels: set = set()           # every label ever fired this session (chat)
+_all_notebook_labels: set = set()
+_chat_turn_counter: int = 0
+_notebook_turn_counter: int = 0
+
 # FIX #10: A dedicated lock for all mutations to the global lorebook state
 # (current_lorebook, _next_uid, _active_lorebooks). The original only locked
 # _last_injection_info, leaving the rest unprotected across concurrent Gradio events.
@@ -488,7 +504,11 @@ def _find_active_matches(current_text, history_msgs):
 
     matched_list = _apply_inclusion_groups(matched_list)
     matched_list.sort(key=lambda e: e.get("priority", 0), reverse=True)
-    return _trim_to_budget(matched_list)
+    trimmed = _trim_to_budget(matched_list)
+    # Reverse so highest-priority entry is injected last = closest to reply (freshest).
+    # _trim_to_budget already consumed the budget in priority order (highest first),
+    # so the reversal only affects injection order, not which entries survive the cut.
+    return list(reversed(trimmed)), matched_list
 
 
 def _format_injection(entries):
@@ -543,7 +563,9 @@ def _do_wi_injection(scan_text, history_msgs, state):
     if params.get("chat_only_scan") and orig_ctx:
         scan_text = scan_text.replace(orig_ctx, "").strip()
     matched = _find_active_matches(scan_text, history_msgs)
+    matched, all_matched = matched  # unpack (injected_reversed, full_pre_budget_list)
     matched = [e for e in matched if _eff_pos(e) != "notebook"]
+    all_matched = [e for e in all_matched if _eff_pos(e) != "notebook"]
     if matched:
         pref = params["injection_prefix"]
         suf  = params["injection_suffix"]
@@ -561,8 +583,9 @@ def _do_wi_injection(scan_text, history_msgs, state):
     else:
         state[ctx_k] = orig_ctx
         state["_lb_before_reply_entries"] = []
+        all_matched = []
     _cur_injected = {_eid(e) for e in matched} if matched else set()
-    _update_injection_preview(matched, 0)
+    return matched, all_matched
 
 
 def state_modifier(state):
@@ -590,7 +613,7 @@ def state_modifier(state):
     last_user = internal[-1][0]
     if not last_user or last_user == "<|BEGIN-VISIBLE-CHAT|>":
         return state
-    _do_wi_injection(last_user, state[_HIST_MSGS], state)
+    _do_wi_injection(last_user, state[_HIST_MSGS], state)  # result unused; preview written in custom_generate_reply
     return state
 
 
@@ -606,7 +629,13 @@ def chat_input_modifier(text, visible_text, state):
     # the local name to a new dict, so all context mutations were silently discarded and
     # lorebooks never actually injected anything into any prompt.
     history_msgs = state.get(_HIST_MSGS, _gather_messages_list(state.get("history", {}), state.get(_ORIG_CTX)))
-    _do_wi_injection(text or "", history_msgs, state)
+    matched, all_matched = _do_wi_injection(text or "", history_msgs, state)
+    # Store both lists in state so custom_generate_reply can write the preview
+    # using is_chat, which is the only reliable signal for which UI tab is active.
+    # Writing the preview here (before is_chat is known) caused notebook generations
+    # to contaminate the chat store whenever an instruct template was loaded.
+    state["_lb_chat_matched"]     = matched or []
+    state["_lb_chat_all_matched"] = all_matched or []
     # FIX IV: _cur_injected is read on the generation thread in custom_generate_reply.
     # We don't need a lock around the set-comprehension itself (it's a single atomic
     # rebind in CPython), but document the dependency here so it's explicit. The real
@@ -617,11 +646,17 @@ def chat_input_modifier(text, visible_text, state):
     return text, visible_text
 
 
-def _find_new_trigger_entries(text, already_injected):
+def _find_new_trigger_entries(text, already_injected, notebook=False):
     newly = []
     for e in _all_active_entries():
         eid = _eid(e)
         if eid in already_injected or not e.get("enabled", True) or e.get("constant"):
+            continue
+        # In notebook mode only scan notebook-position entries; in chat mode skip them.
+        pos = _eff_pos(e)
+        if notebook and pos != "notebook":
+            continue
+        if not notebook and pos == "notebook":
             continue
         keys = e.get("keys", [])
         if not keys:
@@ -660,13 +695,11 @@ def _replace_world_info_block(prompt, all_entries):
     if not pref or not suf:
         return prompt, []
 
-    trimmed = _trim_to_budget(sorted(all_entries, key=lambda e: e.get("priority", 0), reverse=True))
+    trimmed = list(reversed(_trim_to_budget(sorted(all_entries, key=lambda e: e.get("priority", 0), reverse=True))))
     before_entries       = [e for e in trimmed if _eff_pos(e) == "before_context"]
     after_entries        = [e for e in trimmed if _eff_pos(e) == "after_context"]
     before_reply_entries = [e for e in trimmed if _eff_pos(e) == "before_reply"]
-    # notebook entries are never re-injected here — mid-gen interrupt is a chat-mode
-    # feature and notebook entries were already placed at the end of the prompt in
-    # custom_generate_reply before generation started.
+    notebook_entries     = [e for e in trimmed if _eff_pos(e) == "notebook"]
 
     # FIX (Gemini #2): Strip ALL existing WI blocks then re-inject, so orphaned
     # blocks from prior interrupts don't accumulate in the prompt.
@@ -701,22 +734,117 @@ def _replace_world_info_block(prompt, all_entries):
             ctx = ctx_stripped[:last_nl] + "\n" + block + ctx_stripped[last_nl:] + trailing
         else:
             ctx = block + "\n" + ctx_stripped + trailing
+    if notebook_entries:
+        # Notebook entries: prepend the WI block before the prompt body so the story
+        # text stays at the end of context where the model continues it naturally.
+        # This mirrors the initial notebook injection in custom_generate_reply and
+        # ensures notebook entries survive every mid-gen interrupt re-injection.
+        block = (pref + _format_injection(notebook_entries) + suf).rstrip("\n")
+        ctx_stripped = ctx.rstrip("\n")
+        trailing     = ctx[len(ctx_stripped):]
+        if trailing:
+            # Template-formatted prompt: insert before the assistant header.
+            last_nl = ctx_stripped.rfind("\n")
+            if last_nl != -1:
+                ctx = ctx_stripped[:last_nl] + "\n" + block + ctx_stripped[last_nl:] + trailing
+            else:
+                ctx = block + "\n" + ctx_stripped + trailing
+        else:
+            ctx = block + "\n" + ctx
 
     return ctx, trimmed
 
 
-def _update_injection_preview(all_fired, interrupt_count):
+def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget_dropped=None):
+    import datetime
+    global _prev_chat_labels, _prev_notebook_labels
+    global _all_chat_labels, _all_notebook_labels
+    global _chat_turn_counter, _notebook_turn_counter
+
     rows = []
     total_chars = 0
+    labels_this_turn: set = set()
+
     for e in all_fired:
         chars = len(e.get("content", ""))
         total_chars += chars
         label = e.get("comment", "") or ", ".join(e.get("keys", []))[:30] or f"UID {e.get('uid')}"
         rows.append((label, chars // params["chars_per_token"] if chars else 0))
-    with _last_injection_lock:
-        _last_injection_info["entries"] = rows
-        _last_injection_info["interrupts"] = interrupt_count
-        _last_injection_info["total_tokens"] = total_chars // params["chars_per_token"] if total_chars else 0
+        labels_this_turn.add(label)
+
+    total_tokens = total_chars // params["chars_per_token"] if total_chars else 0
+
+    # Choose the correct session sets for this path.
+    prev_labels = _prev_notebook_labels if notebook else _prev_chat_labels
+    all_labels  = _all_notebook_labels  if notebook else _all_chat_labels
+
+    # Classify each entry relative to previous turns.
+    entry_records = []
+    for label, tokens in rows:
+        if label not in all_labels:
+            status = "new"         # never fired before this session
+        elif label in prev_labels:
+            status = "repeat"      # fired last turn too
+        else:
+            status = "returned"    # fired before but skipped at least one turn
+        entry_records.append({"label": label, "tokens": tokens, "status": status})
+
+    # Entries that triggered keywords but were cut by the token budget.
+    budget_dropped_records = []
+    if budget_dropped:
+        injected_labels = labels_this_turn
+        for e in budget_dropped:
+            label = e.get("comment", "") or ", ".join(e.get("keys", []))[:30] or f"UID {e.get('uid')}"
+            if label in injected_labels:
+                continue  # made it in — don't double-count
+            chars = len(e.get("content", ""))
+            tokens = chars // params["chars_per_token"] if chars else 0
+            budget_dropped_records.append({"label": label, "tokens": tokens, "status": "budget_dropped"})
+
+    # Entries present last turn that are gone this turn (keyword no longer matches).
+    dropped = [lbl for lbl in prev_labels if lbl not in labels_this_turn]
+
+    # Advance session state.
+    all_labels.update(labels_this_turn)
+    if notebook:
+        _all_notebook_labels    = all_labels
+        _prev_notebook_labels   = labels_this_turn
+        _notebook_turn_counter += 1
+        turn_num = _notebook_turn_counter
+    else:
+        _all_chat_labels   = all_labels
+        _prev_chat_labels  = labels_this_turn
+        _chat_turn_counter += 1
+        turn_num = _chat_turn_counter
+
+    record = {
+        "turn":           turn_num,
+        "time":           datetime.datetime.now().strftime("%H:%M:%S"),
+        "entries":        entry_records,   # injected (priority order, highest = freshest)
+        "budget_dropped": budget_dropped_records,  # triggered but cut by token budget
+        "dropped":        dropped,
+        "total_tokens":   total_tokens,
+        "interrupts":     interrupt_count,
+    }
+
+    if notebook:
+        with _last_notebook_injection_lock:
+            _last_notebook_injection_info["entries"] = rows
+            _last_notebook_injection_info["interrupts"] = interrupt_count
+            _last_notebook_injection_info["total_tokens"] = total_tokens
+        with _injection_history_lock:
+            _injection_history_notebook.insert(0, record)
+            if len(_injection_history_notebook) > 60:
+                _injection_history_notebook.pop()
+    else:
+        with _last_injection_lock:
+            _last_injection_info["entries"] = rows
+            _last_injection_info["interrupts"] = interrupt_count
+            _last_injection_info["total_tokens"] = total_tokens
+        with _injection_history_lock:
+            _injection_history.insert(0, record)
+            if len(_injection_history) > 60:
+                _injection_history.pop()
 
 
 def _find_notebook_matches(question_text):
@@ -728,30 +856,31 @@ def _find_notebook_matches(question_text):
     """
     all_entries = _all_active_entries()
     notebook_candidates = [e for e in all_entries if _eff_pos(e) == "notebook"]
-    seen_uids = set()
+    seen_eids_nb = set()
     matched = []
 
     for e in notebook_candidates:
-        uid = e.get("uid")
-        if uid in seen_uids or not e.get("enabled", True):
+        eid = _eid(e)
+        if eid in seen_eids_nb or not e.get("enabled", True):
             continue
         prob = max(0, min(100, e.get("probability", 100)))
         if prob <= 0 or (prob < 100 and random.randint(1, 100) > prob):
             continue
         if e.get("constant"):
-            seen_uids.add(uid)
+            seen_eids_nb.add(eid)
             matched.append(e)
             continue
         keys = e.get("keys", [])
         if not keys:
             continue
         if any(_hit_key(k, question_text, e) for k in keys):
-            seen_uids.add(uid)
+            seen_eids_nb.add(eid)
             matched.append(e)
 
     matched = _apply_inclusion_groups(matched)
     matched.sort(key=lambda e: e.get("priority", 0), reverse=True)
-    return _trim_to_budget(matched)
+    trimmed = _trim_to_budget(matched)
+    return list(reversed(trimmed)), matched
 
 
 def custom_generate_reply(question, original_question, state,
@@ -769,6 +898,7 @@ def custom_generate_reply(question, original_question, state,
     # mid-gen interrupt is disabled. chat_input_modifier stored these in state rather
     # than the system message; we insert them here just above the bot prefix line so
     # the model sees them at maximum recency, immediately before its response.
+    nb_for_interrupt = []   # notebook entries already injected; feeds the interrupt loop
     if params["activate"] and _active_lorebooks:
         pref = params["injection_prefix"]
         suf  = params["injection_suffix"]
@@ -777,7 +907,8 @@ def custom_generate_reply(question, original_question, state,
                 # ── Notebook / text-completion mode ──────────────────────────────
                 # chat_input_modifier never runs here, so we scan the raw prompt
                 # directly for notebook-position entries and insert the WI block.
-                nb_matched = _find_notebook_matches(question)
+                nb_matched, nb_all_matched = _find_notebook_matches(question)
+                nb_for_interrupt = nb_matched  # carry into interrupt loop below
                 if nb_matched:
                     block = (pref + _format_injection(nb_matched) + suf).rstrip("\n")
                     # FIX: When an instruct-template model is used in notebook mode
@@ -807,7 +938,21 @@ def custom_generate_reply(question, original_question, state,
                         # (0 tokens generated) — the WI fired but generation never ran.
                         question = block + "\n" + question
                     original_question = question
-                    _update_injection_preview(nb_matched, 0)
+                    # Update _cur_injected so the mid-gen interrupt loop's `already` set
+                    # is seeded with the notebook entries that were just injected.
+                    # Without this, _cur_injected holds stale chat-path data (or nothing),
+                    # all_injected_entries starts empty, last_trimmed ends empty, and every
+                    # notebook entry shows as DROPPED rather than REPEAT/BUDGET CUT.
+                    global _cur_injected
+                    _cur_injected = {_eid(e) for e in nb_matched}
+                    # Build budget_dropped = entries that matched but didn't fit.
+                    injected_eids = {_eid(e) for e in nb_matched}
+                    nb_budget_dropped = [e for e in nb_all_matched if _eid(e) not in injected_eids]
+                    _update_injection_preview(nb_matched, 0, notebook=True, budget_dropped=nb_budget_dropped)
+                elif nb_all_matched:
+                    # Everything matched but nothing fit in budget.
+                    _cur_injected = set()
+                    _update_injection_preview([], 0, notebook=True, budget_dropped=nb_all_matched)
             else:
                 # ── Chat mode ────────────────────────────────────────────────────
                 before_reply_entries = state.get("_lb_before_reply_entries", [])
@@ -829,12 +974,25 @@ def custom_generate_reply(question, original_question, state,
                     original_question = question
 
     if not params["activate"] or not params["mid_gen_interrupt"] or not _active_lorebooks:
+        # Write the chat preview here — chat_input_modifier no longer does it so that
+        # notebook generations (is_chat=False) can never contaminate the chat store.
+        if is_chat:
+            chat_matched     = state.get("_lb_chat_matched", [])
+            chat_all_matched = state.get("_lb_chat_all_matched", [])
+            injected_eids    = {_eid(e) for e in chat_matched}
+            chat_budget_dropped = [e for e in chat_all_matched if _eid(e) not in injected_eids]
+            _update_injection_preview(chat_matched, 0, notebook=False, budget_dropped=chat_budget_dropped)
         yield from _base_gen(question, original_question, state)
         return
 
     max_ints = max(0, int(params["max_interrupts"]))
-    already = set(_cur_injected)
-    all_injected_entries = [e for e in _all_active_entries() if _eid(e) in already]
+    if is_chat:
+        already = set(_cur_injected)
+        all_injected_entries = [e for e in _all_active_entries() if _eid(e) in already]
+    else:
+        # notebook: _cur_injected is never set for this path; use the entries we just injected
+        already = {_eid(e) for e in nb_for_interrupt}
+        all_injected_entries = list(nb_for_interrupt)
     cur_question = question
     cur_original = original_question
     cumulative_text = ""
@@ -874,7 +1032,7 @@ def custom_generate_reply(question, original_question, state,
                 m_tail   = re.search(r'\w+$', word_buf)
                 scan_buf = word_buf[:m_tail.start()] if m_tail else word_buf
                 pending  = word_buf[m_tail.start():] if m_tail else ""
-                new_entries = _find_new_trigger_entries(scan_buf, already) if scan_buf else []
+                new_entries = _find_new_trigger_entries(scan_buf, already, notebook=not is_chat) if scan_buf else []
                 if new_entries:
                     # FIX #6: Only clear word_buf when an interrupt actually fires.
                     # The original always wiped it on whitespace, so multi-word keys like
@@ -901,7 +1059,9 @@ def custom_generate_reply(question, original_question, state,
         if not interrupted:
             break
 
-    _update_injection_preview(last_trimmed, interrupts)
+    injected_eids = {_eid(e) for e in last_trimmed}
+    budget_dropped = [e for e in all_injected_entries if _eid(e) not in injected_eids]
+    _update_injection_preview(last_trimmed, interrupts, notebook=not is_chat, budget_dropped=budget_dropped)
     yield cumulative_text
 
 
@@ -987,6 +1147,123 @@ def _build_stats_html():
             f'{_card("~" + str(tok) if tok else "—", "tokens last turn")}'
             f'{_card(ints, "interrupts")}'
             f'</div>')
+
+
+def _build_history_html(notebook=False):
+    """Render the full session injection history as a scrollable HTML block.
+
+    Each card shows one generation turn:
+      • Numbered rows in priority order — #1 = oldest in context (lowest priority);
+        the last row = freshest (highest priority, closest to the reply).
+      • NEW      = first time this label has fired this session.
+      • REPEAT   = also fired the immediately preceding turn.
+      • RETURNED = fired before but skipped ≥1 turn in between.
+      • BUDGET ✂  = keyword matched but entry was cut by the token budget.
+      • DROPPED  = were injected last turn but keyword no longer matches this turn.
+    """
+    with _injection_history_lock:
+        history = list(_injection_history_notebook if notebook else _injection_history)
+
+    if not history:
+        msg = "use the Notebook tab first" if notebook else "send a message first"
+        return (f'<p style="color:var(--body-text-color-subdued);font-size:13px;padding:8px 4px">'
+                f'No history yet — {msg}.</p>')
+
+    _S = {
+        # status: (emoji, bg, border-color, text-color)
+        "new":           ("🆕", "rgba(34,197,94,.14)",  "rgba(34,197,94,.55)",  "#15803d"),
+        "repeat":        ("🔁", "rgba(99,102,241,.10)", "rgba(99,102,241,.40)", "var(--body-text-color-subdued)"),
+        "returned":      ("↩️", "rgba(245,158,11,.13)", "rgba(245,158,11,.50)", "#b45309"),
+        "budget_dropped":("✂",  "rgba(251,146,60,.13)", "rgba(251,146,60,.50)", "#c2410c"),
+    }
+
+    cards = []
+    for rec in history:
+        entries         = rec["entries"]   # [{label, tokens, status}]
+        budget_dropped  = rec.get("budget_dropped", [])
+        dropped         = rec["dropped"]
+        total           = len(entries)
+        ints            = rec["interrupts"]
+
+        # ── header ──
+        int_note = f" &nbsp;·&nbsp; {ints} interrupt{'s' if ints != 1 else ''}" if ints else ""
+        header = (
+            f'<div style="padding:5px 10px 5px 10px;'
+            f'background:var(--color-background-secondary,rgba(0,0,0,.05));'
+            f'border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.08));'
+            f'font-size:11px;font-weight:600;display:flex;justify-content:space-between;align-items:center">'
+            f'<span>Turn {rec["turn"]}{int_note}</span>'
+            f'<span style="font-weight:400;color:var(--body-text-color-subdued)">'
+            f'~{rec["total_tokens"]} tokens &nbsp;·&nbsp; {rec["time"]}</span>'
+            f'</div>'
+        )
+
+        # ── entry rows ──
+        row_html = []
+        for i, e in enumerate(entries):
+            # Position label: first = oldest in context, last = freshest (closest to reply)
+            if total == 1:
+                pos = "#1"
+            elif i == 0:
+                pos = "#1 &nbsp;<span title='Lowest priority — appears deepest in context; first to be forgotten as context grows' style='opacity:.55;font-size:10px'>oldest</span>"
+            elif i == total - 1:
+                pos = f"#{total} &nbsp;<span title='Highest priority — closest to the reply; freshest in the model attention window' style='opacity:.55;font-size:10px'>freshest</span>"
+            else:
+                pos = f"#{i + 1}"
+
+            em, bg, bc, tc = _S.get(e["status"], _S["repeat"])
+            badge = (f'<span style="font-size:10px;padding:1px 7px;border-radius:10px;'
+                     f'background:{bg};border:1px solid {bc};color:{tc};white-space:nowrap">'
+                     f'{em} {e["status"].upper()}</span>')
+            row_html.append(
+                f'<tr style="border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.06))">'
+                f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued);'
+                f'white-space:nowrap;vertical-align:middle">{pos}</td>'
+                f'<td style="padding:4px 8px;font-size:12px;vertical-align:middle">{e["label"]}</td>'
+                f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued);'
+                f'text-align:right;white-space:nowrap;vertical-align:middle">~{e["tokens"]} tok</td>'
+                f'<td style="padding:4px 8px;text-align:right;vertical-align:middle">{badge}</td>'
+                f'</tr>'
+            )
+
+        # ── budget-cut rows (triggered keyword but didn't fit in the token budget) ──
+        for e in budget_dropped:
+            em, bg, bc, tc = _S["budget_dropped"]
+            badge = (f'<span style="font-size:10px;padding:1px 7px;border-radius:10px;'
+                     f'background:{bg};border:1px solid {bc};color:{tc};white-space:nowrap">'
+                     f'{em} BUDGET CUT</span>')
+            row_html.append(
+                f'<tr style="opacity:.55;border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.06))">'
+                f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued)">—</td>'
+                f'<td style="padding:4px 8px;font-size:12px;font-style:italic">{e["label"]}</td>'
+                f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued);'
+                f'text-align:right;white-space:nowrap">~{e["tokens"]} tok</td>'
+                f'<td style="padding:4px 8px;text-align:right">{badge}</td>'
+                f'</tr>'
+            )
+
+        # ── keyword-dropped rows (no longer matching) ──
+        for lbl in dropped:
+            row_html.append(
+                f'<tr style="opacity:.40;border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.06))">'
+                f'<td style="padding:4px 8px;font-size:11px;color:var(--body-text-color-subdued)">—</td>'
+                f'<td style="padding:4px 8px;font-size:12px;text-decoration:line-through">{lbl}</td>'
+                f'<td style="padding:4px 8px"></td>'
+                f'<td style="padding:4px 8px;text-align:right">'
+                f'<span style="font-size:10px;padding:1px 7px;border-radius:10px;'
+                f'background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.40);'
+                f'color:#dc2626;white-space:nowrap">⬇ DROPPED</span></td>'
+                f'</tr>'
+            )
+
+        table = f'<table style="width:100%;border-collapse:collapse">{"".join(row_html)}</table>'
+        cards.append(
+            f'<div style="margin-bottom:7px;border:1px solid var(--border-color-primary,rgba(0,0,0,.1));'
+            f'border-radius:8px;overflow:hidden">{header}{table}</div>'
+        )
+
+    return (f'<div style="max-height:360px;overflow-y:auto;padding:2px 0">'
+            + "".join(cards) + '</div>')
 
 
 def custom_css():
@@ -1132,9 +1409,21 @@ def ui():
                 with gr.Tab("Overview"):
                     stats_html = gr.HTML(_build_stats_html())
                     stats_refresh_btn = gr.Button("Refresh stats", elem_classes="refresh-button")
-                    gr.Markdown("Last injection — which entries fired and their token cost.")
-                    preview_box = gr.Markdown("*No generation yet — send a message first.*")
-                    preview_refresh_btn = gr.Button("Refresh injection", elem_classes="refresh-button")
+                    with gr.Tabs():
+                        with gr.Tab("Chat / Instruct"):
+                            gr.Markdown("**Last injection** — entries in priority order. #1 = lowest priority (deepest in context, oldest). Last # = highest priority (closest to reply, freshest).")
+                            preview_box = gr.Markdown("*No generation yet — send a message first.*")
+                            preview_refresh_btn = gr.Button("Refresh injection", elem_classes="refresh-button")
+                            gr.Markdown("**Session history** — tracks what fired, what was new, what got dropped each turn.")
+                            history_box = gr.HTML(_build_history_html(notebook=False))
+                            history_clear_btn = gr.Button("Clear history", elem_classes="refresh-button")
+                        with gr.Tab("Notebook"):
+                            gr.Markdown("**Last injection** — entries in priority order. #1 = lowest priority (deepest in context, oldest). Last # = highest priority (closest to generation point, freshest).")
+                            notebook_preview_box = gr.Markdown("*No generation yet — use the Notebook tab first.*")
+                            notebook_preview_refresh_btn = gr.Button("Refresh injection", elem_classes="refresh-button")
+                            gr.Markdown("**Session history** — tracks what fired, what was new, what got dropped each turn.")
+                            notebook_history_box = gr.HTML(_build_history_html(notebook=True))
+                            notebook_history_clear_btn = gr.Button("Clear history", elem_classes="refresh-button")
 
                 with gr.Tab("All entries"):
                     gr.Markdown("Quick table of all entries in the currently open lorebook.")
@@ -1551,12 +1840,63 @@ def ui():
         with _last_injection_lock:
             info = dict(_last_injection_info)
         if not info["entries"]:
-            return gr.update(value="*No injection recorded yet — send a message first.*")
-        lines = ["| Entry | Est. tokens |", "|-------|-------------|"]
-        for label, toks in info["entries"]:
-            lines.append(f"| {label} | {toks} |")
-        lines.append(f"\n**Total: ~{info['total_tokens']} tokens** | **Interrupts: {info['interrupts']}**")
-        return gr.update(value="\n".join(lines))
+            table_md = "*No injection recorded yet — send a message first.*"
+        else:
+            total = len(info["entries"])
+            lines = ["| # | Entry | Est. tokens |", "|---|-------|-------------|"]
+            for i, (label, toks) in enumerate(info["entries"]):
+                if total == 1:
+                    pos = "#1"
+                elif i == 0:
+                    pos = "#1 *(oldest)*"
+                elif i == total - 1:
+                    pos = f"#{total} *(freshest)*"
+                else:
+                    pos = f"#{i + 1}"
+                lines.append(f"| {pos} | {label} | {toks} |")
+            lines.append(f"\n**Total: ~{info['total_tokens']} tokens** | **Interrupts: {info['interrupts']}**")
+            table_md = "\n".join(lines)
+        return gr.update(value=table_md), gr.update(value=_build_history_html(notebook=False))
+
+    def _do_preview_refresh_notebook():
+        with _last_notebook_injection_lock:
+            info = dict(_last_notebook_injection_info)
+        if not info["entries"]:
+            table_md = "*No injection recorded yet — use the Notebook tab first.*"
+        else:
+            total = len(info["entries"])
+            lines = ["| # | Entry | Est. tokens |", "|---|-------|-------------|"]
+            for i, (label, toks) in enumerate(info["entries"]):
+                if total == 1:
+                    pos = "#1"
+                elif i == 0:
+                    pos = "#1 *(oldest)*"
+                elif i == total - 1:
+                    pos = f"#{total} *(freshest)*"
+                else:
+                    pos = f"#{i + 1}"
+                lines.append(f"| {pos} | {label} | {toks} |")
+            lines.append(f"\n**Total: ~{info['total_tokens']} tokens**")
+            table_md = "\n".join(lines)
+        return gr.update(value=table_md), gr.update(value=_build_history_html(notebook=True))
+
+    def _do_clear_history():
+        global _injection_history, _prev_chat_labels, _all_chat_labels, _chat_turn_counter
+        with _injection_history_lock:
+            _injection_history.clear()
+        _prev_chat_labels = set()
+        _all_chat_labels  = set()
+        _chat_turn_counter = 0
+        return gr.update(value=_build_history_html(notebook=False))
+
+    def _do_clear_history_notebook():
+        global _injection_history_notebook, _prev_notebook_labels, _all_notebook_labels, _notebook_turn_counter
+        with _injection_history_lock:
+            _injection_history_notebook.clear()
+        _prev_notebook_labels  = set()
+        _all_notebook_labels   = set()
+        _notebook_turn_counter = 0
+        return gr.update(value=_build_history_html(notebook=True))
 
     def _set_activate(x):
         params["activate"] = x
@@ -1683,4 +2023,7 @@ def ui():
     # Overview + stats + preview refresh
     overview_btn.click(   _do_overview,                                   [],  [overview_box])
     stats_refresh_btn.click(lambda: gr.update(value=_build_stats_html()), [],  [stats_html])
-    preview_refresh_btn.click(_do_preview_refresh,                        [],  [preview_box])
+    preview_refresh_btn.click(        _do_preview_refresh,          [], [preview_box,          history_box])
+    notebook_preview_refresh_btn.click(_do_preview_refresh_notebook, [], [notebook_preview_box, notebook_history_box])
+    history_clear_btn.click(          _do_clear_history,            [], [history_box])
+    notebook_history_clear_btn.click( _do_clear_history_notebook,   [], [notebook_history_box])
