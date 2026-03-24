@@ -35,6 +35,15 @@ params = {
     "position_override_enabled": False,
     "position_override_value": "after_context",
     "chat_only_scan": False,
+    # ── Auto-summary ──────────────────────────────────────────────────────────
+    # When enabled, every `auto_summary_interval` tokens of generated output the
+    # model is asked to write a running story summary. That summary is stored in a
+    # constant lorebook entry ("📖 Story Summary") in the first active lorebook,
+    # so it gets injected into every subsequent turn automatically.
+    "auto_summary_enabled": False,
+    "auto_summary_interval": 8000,    # tokens between summary refreshes
+    "auto_summary_max_new_tokens": 512,
+    "auto_summary_history_turns": 40, # how many recent turns to include in the prompt
 }
 
 _MAX_GATHER_DEPTH = 20
@@ -51,6 +60,8 @@ _PARAMS_PERSIST_KEYS = {
     "constant_entries", "recursive_scan", "max_recursion_steps", "mid_gen_interrupt",
     "max_interrupts", "position_override_enabled", "position_override_value",
     "chat_only_scan",
+    "auto_summary_enabled", "auto_summary_interval", "auto_summary_max_new_tokens",
+    "auto_summary_history_turns",
 }
 
 current_lorebook: dict | None = None
@@ -84,6 +95,21 @@ _notebook_turn_counter: int = 0
 # (current_lorebook, _next_uid, _active_lorebooks). The original only locked
 # _last_injection_info, leaving the rest unprotected across concurrent Gradio events.
 _state_lock = threading.RLock()  # RLock so _save_active_state can be called from inside locked blocks
+
+# ── Auto-summary state ────────────────────────────────────────────────────────
+_AUTO_SUMMARY_LABEL    = "📖 Story Summary"  # comment field value for the managed entry
+_SUMMARY_LB_PREFIX     = "_summary_"         # lorebook filename prefix for auto-summary books
+_summary_lock          = threading.Lock()
+_summary_status: str   = ""                  # shown in the UI status line
+
+# Per-character counters and turn-tracking, keyed by character_stem.
+# Each value is a dict:  {"tokens": int, "last_turn": int}
+# "tokens"    — generated tokens accumulated since the last summary for this character.
+# "last_turn" — len(history["internal"]) at the time of the last summary.
+#               0 means "never summarized" → do a full summarize next time.
+_summary_char_state: dict = {}
+
+_active_summary_stem: str = ""   # stem of the currently loaded per-character summary lorebook
 
 _ST_SELECTIVE_INT_TO_STR = {0: "AND ANY", 1: "NOT ALL", 2: "NOT ANY", 3: "AND ALL"}
 _ST_SELECTIVE_STR_TO_INT = {v: k for k, v in _ST_SELECTIVE_INT_TO_STR.items()}
@@ -628,6 +654,14 @@ def state_modifier(state):
     last_user = internal[-1][0]
     if not last_user or last_user == "<|BEGIN-VISIBLE-CHAT|>":
         return state
+
+    # Auto-summary: ensure the per-character summary lorebook is active.
+    # This runs on every state_modifier call (cheap once the lorebook is loaded).
+    if params.get("auto_summary_enabled") and params.get("activate"):
+        try:
+            _ensure_summary_lorebook(_char_stem(state))
+        except Exception:
+            pass
     # FIX: On regenerate, chat_input_modifier never runs, so _lb_chat_matched /
     # _lb_chat_all_matched are never written to state.  The mid_gen ON path in
     # custom_generate_reply reads _cur_injected directly and is unaffected, but
@@ -1021,7 +1055,39 @@ def custom_generate_reply(question, original_question, state,
             injected_eids    = {_eid(e) for e in chat_matched}
             chat_budget_dropped = [e for e in chat_all_matched if _eid(e) not in injected_eids]
             _update_injection_preview(chat_matched, 0, notebook=False, budget_dropped=chat_budget_dropped)
-        yield from _base_gen(question, original_question, state)
+
+        # ── Run normal generation, then check auto-summary threshold ──────────
+        final_reply = ""
+        for chunk in _base_gen(question, original_question, state):
+            final_reply = chunk
+            yield chunk
+
+        # Auto-summary: only in chat mode, only when enabled, only when at least
+        # one lorebook is active.  Mid-gen interrupt is intentionally NOT used for
+        # the summary pass — it runs as a clean, isolated generation.
+        if (is_chat
+                and params.get("auto_summary_enabled")
+                and params.get("activate")
+                and _active_lorebooks):
+            char = _char_stem(state)
+            reply_tokens = _count_tokens(final_reply)
+            interval = max(1, int(params.get("auto_summary_interval", 8000)))
+            should_summarise = False
+            with _summary_lock:
+                cs = _summary_char_state.setdefault(char, {"tokens": 0, "last_turn": 0})
+                cs["tokens"] += reply_tokens
+                if cs["tokens"] >= interval:
+                    cs["tokens"] = 0
+                    should_summarise = True
+
+            if should_summarise:
+                _ensure_summary_lorebook(char)
+                # Show the "Summarizing…" note in the chat window while we work.
+                yield final_reply + _SUMMARY_PENDING_SUFFIX
+                history_snapshot = copy.deepcopy(state.get("history", {}))
+                _run_summary_inline(history_snapshot, char, _base_gen)
+                # Final clean yield — this is what oobabooga stores in history.
+                yield final_reply
         return
 
     max_ints = max(0, int(params["max_interrupts"]))
@@ -1101,10 +1167,336 @@ def custom_generate_reply(question, original_question, state,
     injected_eids = {_eid(e) for e in last_trimmed}
     budget_dropped = [e for e in all_injected_entries if _eid(e) not in injected_eids]
     _update_injection_preview(last_trimmed, interrupts, notebook=not is_chat, budget_dropped=budget_dropped)
+
+    # Auto-summary threshold check — same logic as the non-interrupt path above.
+    if (is_chat
+            and params.get("auto_summary_enabled")
+            and params.get("activate")
+            and _active_lorebooks):
+        char = _char_stem(state)
+        reply_tokens = _count_tokens(cumulative_text)
+        interval = max(1, int(params.get("auto_summary_interval", 8000)))
+        should_summarise = False
+        with _summary_lock:
+            cs = _summary_char_state.setdefault(char, {"tokens": 0, "last_turn": 0})
+            cs["tokens"] += reply_tokens
+            if cs["tokens"] >= interval:
+                cs["tokens"] = 0
+                should_summarise = True
+
+        if should_summarise:
+            _ensure_summary_lorebook(char)
+            yield cumulative_text + _SUMMARY_PENDING_SUFFIX
+            history_snapshot = copy.deepcopy(state.get("history", {}))
+            _run_summary_inline(history_snapshot, char, _base_gen)
+
     yield cumulative_text
 
 
-# ── UI helpers ────────────────────────────────────────────────────────────────
+# ── Auto-summary engine ───────────────────────────────────────────────────────
+# Design:
+#   • Each character gets their own dedicated summary lorebook (_summary_<stem>).
+#     It is auto-created and auto-activated when that character loads, so multiple
+#     chat logs / characters never share or overwrite each other's summaries.
+#   • Token counting is per-character, keyed by character_stem.
+#   • When the threshold is crossed the summary runs *synchronously* inside
+#     custom_generate_reply, as a completely isolated _base_gen call with its own
+#     dedicated prompt and mid-gen interrupt bypassed entirely.
+#   • While the summary is generating we yield  reply + SUMMARY_PENDING_SUFFIX
+#     so the user sees a "Summarizing…" note in the chat window.
+#   • The very last yield is the clean reply (no suffix) — that is what
+#     oobabooga stores in history, so the note never pollutes the log.
+#   • DELTA updates: we record how many history turns existed at the last summary.
+#     On the next trigger we only feed the *new* turns + the previous summary text
+#     to the model, asking it to extend/update — rather than re-processing the
+#     entire history from scratch.
+#   • The summary entry is a CONSTANT entry with priority 999, injected
+#     before_context — it always wins the budget and is the first thing the model
+#     reads every turn.
+
+_SUMMARY_PENDING_SUFFIX = "\n\n*(📖 Summarizing story so far… please wait.)*"
+
+
+def _char_stem(state: dict) -> str:
+    """Return a safe filesystem stem for the current character.
+
+    oobabooga stores the character name in state['character_menu'].  We sanitise
+    it the same way _safe_stem() sanitises lorebook names so it's safe to use as
+    a filename component.
+    """
+    raw = state.get("character_menu", "") or "default"
+    return _safe_stem(str(raw)) or "default"
+
+
+def _summary_lb_stem(char_stem: str) -> str:
+    """Return the lorebook stem for this character's auto-summary book."""
+    return f"{_SUMMARY_LB_PREFIX}{char_stem}"
+
+
+def _ensure_summary_lorebook(char_stem: str) -> str:
+    """Guarantee the per-character summary lorebook exists on disk and in
+    _active_lorebooks.  Returns the lorebook stem.
+
+    Called from state_modifier (on every generation) so it must be fast when the
+    lorebook is already active — the early-exit path is a single dict lookup under
+    the lock.
+    """
+    global _active_summary_stem
+    lb_stem = _summary_lb_stem(char_stem)
+
+    with _state_lock:
+        # Fast path: already active for this character.
+        if lb_stem in _active_lorebooks:
+            _active_summary_stem = lb_stem
+            return lb_stem
+
+        # Deactivate the previous character's summary lorebook (if any) so it
+        # doesn't inject stale entries into a different character's chat.
+        if _active_summary_stem and _active_summary_stem in _active_lorebooks:
+            del _active_lorebooks[_active_summary_stem]
+
+        # Load from disk or create fresh.
+        lb = load_lorebook(lb_stem)
+        if lb is None:
+            lb = {
+                "name": f"Auto Summary — {char_stem}",
+                "description": "Auto-managed story summary lorebook. Do not edit manually.",
+                "entries": [],
+            }
+            save_lorebook_file(lb_stem, lb)
+
+        # Ensure the summary entry exists inside the lorebook.
+        has_entry = any(e.get("comment") == _AUTO_SUMMARY_LABEL for e in lb.get("entries", []))
+        if not has_entry:
+            new_uid = max((e.get("uid", 0) for e in lb.get("entries", [])), default=0) + 1
+            lb["entries"].append({
+                "uid": new_uid,
+                "enabled": True,
+                "comment": _AUTO_SUMMARY_LABEL,
+                "keys": [],
+                "secondary_keys": [],
+                "selective_logic": "AND ANY",
+                # Placeholder shown until the first real summary is written.
+                "content": "(Story summary not yet generated — will appear after the first summary cycle.)",
+                "case_sensitive": False,
+                "match_whole_words": True,
+                "use_regex": False,
+                "priority": 999,          # always wins the token budget
+                "position": "before_context",  # injected first, before all other context
+                "scan_depth": 0,
+                "probability": 100,
+                "inclusion_group": "",
+                "constant": True,         # always injected, no trigger keywords needed
+            })
+            save_lorebook_file(lb_stem, lb)
+
+        _active_lorebooks[lb_stem] = lb
+        _active_summary_stem = lb_stem
+        _save_active_state()
+        return lb_stem
+
+
+def _get_current_summary(char_stem: str) -> str:
+    """Return the current summary text for this character (may be the placeholder)."""
+    lb_stem = _summary_lb_stem(char_stem)
+    with _state_lock:
+        lb = _active_lorebooks.get(lb_stem) or load_lorebook(lb_stem) or {}
+    for e in lb.get("entries", []):
+        if e.get("comment") == _AUTO_SUMMARY_LABEL:
+            return e.get("content", "")
+    return ""
+
+
+def _update_summary_entry(char_stem: str, new_content: str) -> None:
+    """Overwrite the Story Summary entry for this character and persist to disk."""
+    lb_stem = _summary_lb_stem(char_stem)
+    with _state_lock:
+        lb = _active_lorebooks.get(lb_stem)
+        if lb is None:
+            return
+        for e in lb.get("entries", []):
+            if e.get("comment") == _AUTO_SUMMARY_LABEL:
+                e["content"] = new_content
+                _sync_active_lorebook()
+                save_lorebook_file(lb_stem, lb)
+                return
+
+
+def _build_full_summary_prompt(history_snapshot: dict) -> str:
+    """Full summarisation prompt — used on the very first summary, or when
+    'Force summary now' is pressed (which resets last_turn to 0)."""
+    n = int(params.get("auto_summary_history_turns", 40))
+    turns = history_snapshot.get("internal", [])[-n:]
+    lines = []
+    for u, a in turns:
+        u = (u or "").strip()
+        a = (a or "").strip()
+        if u and u != "<|BEGIN-VISIBLE-CHAT|>":
+            lines.append(f"[User]: {u}")
+        if a:
+            lines.append(f"[Assistant]: {a}")
+    convo = "\n".join(lines)
+    return (
+        "You are a meticulous story chronicler. Your task is to write a detailed, "
+        "chronological summary of an ongoing collaborative roleplay story based on "
+        "the conversation transcript below.\n\n"
+        "Your summary MUST include, in order:\n"
+        "1. The setting and situation at the start of the story.\n"
+        "2. Every significant event that has occurred, listed chronologically.\n"
+        "3. Every decision made by the user/player and the direct consequences of "
+        "those decisions.\n"
+        "4. Key character moments: emotions, relationships, rivalries, alliances.\n"
+        "5. Important world details, locations, and lore that have been established.\n"
+        "6. Any unresolved plot threads, mysteries, or pending choices.\n\n"
+        "Rules:\n"
+        "- Write in plain, dense prose. No bullet points, no headers.\n"
+        "- Be specific — use character names, place names, and exact events.\n"
+        "- Do NOT editorialize or add your own commentary.\n"
+        "- Do NOT start with 'Sure', 'Here is', or any preamble. "
+        "Begin the summary immediately.\n\n"
+        "--- STORY TRANSCRIPT ---\n"
+        f"{convo}\n"
+        "--- END TRANSCRIPT ---\n\n"
+        "Detailed chronological story summary:"
+    )
+
+
+def _build_delta_summary_prompt(previous_summary: str,
+                                 history_snapshot: dict,
+                                 last_turn: int) -> str:
+    """Delta summarisation prompt — used when a summary already exists.
+
+    Only the turns *after* last_turn are fed to the model, along with the
+    previous summary.  The model is asked to produce a single updated summary
+    that incorporates the new events without re-inventing what came before.
+    """
+    all_turns = history_snapshot.get("internal", [])
+    new_turns = all_turns[last_turn:]          # only events since last summary
+    max_new = int(params.get("auto_summary_history_turns", 40))
+    new_turns = new_turns[-max_new:]           # cap to avoid overflowing context
+
+    lines = []
+    for u, a in new_turns:
+        u = (u or "").strip()
+        a = (a or "").strip()
+        if u and u != "<|BEGIN-VISIBLE-CHAT|>":
+            lines.append(f"[User]: {u}")
+        if a:
+            lines.append(f"[Assistant]: {a}")
+    new_convo = "\n".join(lines)
+
+    return (
+        "You are a meticulous story chronicler maintaining a running summary of "
+        "an ongoing collaborative roleplay.\n\n"
+        "Below is the EXISTING summary of the story up to a certain point, "
+        "followed by the NEW events that have happened since then.\n\n"
+        "Your task: rewrite the summary to incorporate the new events. "
+        "Preserve everything important from the existing summary. "
+        "Add the new events in chronological order at the end.\n\n"
+        "Include:\n"
+        "- Every significant event in chronological order.\n"
+        "- Every decision made by the user/player and its consequences.\n"
+        "- Key character moments, relationships, and emotional beats.\n"
+        "- Important world details, lore, and locations established.\n"
+        "- All unresolved plot threads, mysteries, and pending choices.\n\n"
+        "Rules:\n"
+        "- Write in plain, dense prose. No bullet points, no headers.\n"
+        "- Be specific — use character names, place names, exact events.\n"
+        "- Do NOT editorialize. Do NOT start with 'Sure' or any preamble.\n"
+        "- Begin the updated summary immediately.\n\n"
+        "--- EXISTING SUMMARY ---\n"
+        f"{previous_summary}\n"
+        "--- END EXISTING SUMMARY ---\n\n"
+        "--- NEW EVENTS ---\n"
+        f"{new_convo}\n"
+        "--- END NEW EVENTS ---\n\n"
+        "Updated story summary:"
+    )
+
+
+def _run_summary_inline(history_snapshot: dict, char_stem: str,
+                        base_gen_fn, force_full: bool = False) -> str:
+    """Run one summary generation pass and write the result to the lorebook.
+
+    Called synchronously inside custom_generate_reply.  mid-gen interrupt is
+    intentionally bypassed — base_gen_fn is called directly with a clean state
+    that has no lorebook state attached.
+
+    If force_full is True (e.g. "Force summary now" button), a full re-summarise
+    is performed regardless of whether a previous summary exists.
+    """
+    global _summary_status
+
+    _summary_status = "⏳ Generating story summary…"
+
+    # Decide: full summarise or delta update?
+    with _summary_lock:
+        char_st = _summary_char_state.get(char_stem, {"tokens": 0, "last_turn": 0})
+        last_turn = char_st["last_turn"]
+
+    previous_summary = _get_current_summary(char_stem)
+    is_placeholder = previous_summary.startswith("(Story summary not yet")
+    current_turn_count = len(history_snapshot.get("internal", []))
+
+    if force_full or last_turn == 0 or is_placeholder:
+        prompt = _build_full_summary_prompt(history_snapshot)
+        mode_label = "full"
+    else:
+        prompt = _build_delta_summary_prompt(previous_summary, history_snapshot, last_turn)
+        mode_label = f"delta (+{current_turn_count - last_turn} turns)"
+
+    summary_state = dict(
+        max_new_tokens=int(params.get("auto_summary_max_new_tokens", 512)),
+        auto_max_new_tokens=False,
+        max_tokens_second=0,
+        temperature=0.35,
+        temperature_last=False,
+        dynamic_temperature=False,
+        dynatemp_low=1, dynatemp_high=1, dynatemp_exponent=1,
+        smoothing_factor=0, smoothing_curve=1,
+        top_p=0.92, min_p=0, top_k=40,
+        typical_p=1, epsilon_cutoff=0, eta_cutoff=0,
+        repetition_penalty=1.1, repetition_penalty_range=0,
+        encoder_repetition_penalty=1, no_repeat_ngram_size=0,
+        penalty_alpha=0, guidance_scale=1,
+        mirostat_mode=0, mirostat_tau=5, mirostat_eta=0.1,
+        do_sample=True, seed=-1,
+        add_bos_token=True, ban_eos_token=False,
+        skip_special_tokens=True,
+        custom_stopping_strings="",
+        truncation_length=4096,
+        mode="chat",
+        custom_system_message="", context="",
+        history={"internal": [], "visible": []},
+    )
+
+    stopping = ["[User]:", "\n\n[User]:", "\n\n[Assistant]:"]
+    summary = ""
+    try:
+        for chunk in base_gen_fn(prompt, prompt, summary_state,
+                                 stopping_strings=stopping, is_chat=False):
+            summary = chunk
+    except Exception as exc:
+        _summary_status = f"❌ Summary error: {exc}"
+        return ""
+
+    summary = summary.strip()
+    if summary:
+        _update_summary_entry(char_stem, summary)
+        # Record the turn index so the next update knows what's already captured.
+        with _summary_lock:
+            _summary_char_state[char_stem] = {
+                "tokens": 0,
+                "last_turn": current_turn_count,
+            }
+        tok = _count_tokens(summary)
+        _summary_status = (
+            f"✅ [{char_stem}] Summary updated ({mode_label}) — "
+            f"{tok} tokens written, {current_turn_count} turns processed."
+        )
+    else:
+        _summary_status = "⚠ Summary generation returned empty text — no update written."
+    return summary
 
 def _get_active_keys():
     """Thread-safe snapshot of active lorebook keys for UI components."""
@@ -1534,6 +1926,44 @@ def ui():
                                                        elem_classes="slim-dropdown",
                                                        interactive=params["position_override_enabled"],
                                                        info="After System Prompt = below character context (stays fresh).  Before System Prompt = above it (grounding).  Between User and Assistant = just before bot reply (maximum recency).  Notebook Mode = text completion only, appended at end of prompt.")
+
+                    gr.HTML('<div style="margin:14px 0 6px;padding:8px 12px;border-left:3px solid rgba(16,185,129,.7);background:rgba(16,185,129,.06);border-radius:0 6px 6px 0"><span style="font-weight:600;font-size:13px;color:var(--body-text-color)">Auto Story Summary</span><span style="font-size:12px;color:var(--body-text-color-subdued)"> — periodically asks the model to summarise the story and stores the result as a constant lorebook entry.</span></div>')
+                    auto_summary_cb = gr.Checkbox(
+                        label="Enable auto story summary",
+                        value=params["auto_summary_enabled"],
+                        info=(
+                            "When ON, every N tokens of generated output the model writes a running "
+                            "story summary. It is saved as a constant entry '📖 Story Summary' in the "
+                            "first active lorebook and injected into every subsequent turn automatically. "
+                            "Only works in chat/instruct mode."
+                        ),
+                    )
+                    with gr.Row():
+                        auto_summary_interval_n = gr.Number(
+                            label="Summary interval (tokens)",
+                            value=params["auto_summary_interval"],
+                            step=512, minimum=0,
+                            info="How many generated tokens to accumulate before triggering a new summary.",
+                        )
+                        auto_summary_max_tokens_n = gr.Number(
+                            label="Summary max new tokens",
+                            value=params["auto_summary_max_new_tokens"],
+                            step=64, minimum=64, maximum=2048,
+                            info="Max tokens the model may use when writing the summary.",
+                        )
+                    auto_summary_history_n = gr.Number(
+                        label="History turns to summarise",
+                        value=params["auto_summary_history_turns"],
+                        step=5, minimum=5, maximum=200,
+                        info="How many recent chat turns are fed to the model when generating the summary.",
+                    )
+                    auto_summary_status_md = gr.Markdown(
+                        value=lambda: _summary_status or "*No summary generated yet this session.*",
+                        label="Last summary status",
+                    )
+                    auto_summary_trigger_btn = gr.Button(
+                        "Force summary now", variant="secondary", elem_classes="refresh-button",
+                    )
 
                 with gr.Tab("Import / Export"):
                     gr.Markdown("#### Import from SillyTavern")
@@ -2058,6 +2488,48 @@ def ui():
     max_interrupts_n.change(    lambda x: _safe_int("max_interrupts",      x),                         [max_interrupts_n],     None)
     position_override_cb.change(_set_position_override, [position_override_cb], [position_override_dd])
     position_override_dd.change(lambda x: _set_param("position_override_value", x),                    [position_override_dd], None)
+
+    # Auto-summary settings
+    auto_summary_cb.change(          lambda x: _set_param("auto_summary_enabled",       x), [auto_summary_cb],          None)
+    auto_summary_interval_n.change(  lambda x: _safe_int("auto_summary_interval",       x), [auto_summary_interval_n],  None)
+    auto_summary_max_tokens_n.change(lambda x: _safe_int("auto_summary_max_new_tokens", x), [auto_summary_max_tokens_n],None)
+    auto_summary_history_n.change(   lambda x: _safe_int("auto_summary_history_turns",  x), [auto_summary_history_n],   None)
+
+    def _do_force_summary():
+        """Manually trigger a full re-summarise from the UI (ignores token counter,
+        resets last_turn to 0 so the entire history is processed fresh)."""
+        global _summary_status
+        # We don't have access to live state here so we use _active_summary_stem
+        # to find the current character's summary lorebook.
+        if not _active_summary_stem:
+            return gr.update(value="⚠ No active character summary lorebook found. Start a chat first.")
+
+        # Derive char_stem from the lorebook stem by stripping the prefix.
+        char = _active_summary_stem[len(_SUMMARY_LB_PREFIX):]
+
+        try:
+            import modules.shared as shared
+            from modules.text_generation import generate_reply_HF, generate_reply_custom
+            def _force_base_gen(q, oq, st):
+                if shared.model.__class__.__name__ in ["LlamaServer", "Exllamav3Model", "TensorRTLLMModel"]:
+                    yield from generate_reply_custom(q, oq, st, [], is_chat=False)
+                else:
+                    yield from generate_reply_HF(q, oq, st, [], is_chat=False)
+        except Exception as exc:
+            return gr.update(value=f"❌ Could not load generation modules: {exc}")
+
+        # Reset last_turn so _run_summary_inline does a full re-summarise.
+        with _summary_lock:
+            _summary_char_state[char] = {"tokens": 0, "last_turn": 0}
+
+        _run_summary_inline({}, char, _force_base_gen, force_full=True)
+        return gr.update(value=_summary_status)
+
+    def _refresh_summary_status():
+        return gr.update(value=_summary_status or "*No summary generated yet this session.*")
+
+    auto_summary_trigger_btn.click(_do_force_summary,      [], [auto_summary_status_md])
+    auto_summary_status_md.change( _refresh_summary_status, [], [auto_summary_status_md])
 
     # Import / Export
     # FIX E: Added lb_name_input, lb_desc_input, entry_radio so the editor populates
