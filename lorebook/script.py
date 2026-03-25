@@ -90,6 +90,9 @@ _summary_status: str   = ""
 
 _summary_char_state: dict = {}
 
+_last_seen_history: dict = {}          # char_stem → last known history snapshot
+_last_seen_history_lock = threading.Lock()
+
 _active_summary_stem: str = ""                                                                
 
 _ST_SELECTIVE_INT_TO_STR = {0: "AND ANY", 1: "NOT ALL", 2: "NOT ANY", 3: "AND ALL"}
@@ -812,13 +815,60 @@ def custom_generate_reply(question, original_question, state,
     import modules.shared as shared
     from modules.text_generation import generate_reply_HF, generate_reply_custom
 
-    def _base_gen(q, oq, st):
+    _outer_stopping = stopping_strings  # capture outer names before nested def shadows them
+    _outer_is_chat  = is_chat
+
+    def _base_gen(q, oq, st, stopping_strings=None, is_chat=None):
+        _stops = stopping_strings if stopping_strings is not None else (_outer_stopping or [])
+        _ic    = is_chat          if is_chat          is not None else _outer_is_chat
         if shared.model.__class__.__name__ in ["LlamaServer", "Exllamav3Model", "TensorRTLLMModel"]:
-            yield from generate_reply_custom(q, oq, st, stopping_strings, is_chat=is_chat)
+            yield from generate_reply_custom(q, oq, st, _stops, is_chat=_ic)
         else:
-            yield from generate_reply_HF(q, oq, st, stopping_strings, is_chat=is_chat)
+            yield from generate_reply_HF(q, oq, st, _stops, is_chat=_ic)
 
     nb_for_interrupt = []                                                                
+
+    # ── Pre-generation auto-summary check ─────────────────────────────────────
+    # Measure context size BEFORE generating (raw context + history, no WI
+    # injections counted).  Trigger a blocking summary pass when the context
+    # exceeds the configured token threshold, then continue to generate normally.
+    if is_chat and params.get("auto_summary_enabled") and params.get("activate"):
+        char = _char_stem(state)
+        # Store history snapshot so "Force summary now" can use it even when
+        # the user clicks the button between turns.
+        with _last_seen_history_lock:
+            _last_seen_history[char] = copy.deepcopy(state.get("history", {}))
+
+        _ensure_summary_lorebook(char)
+        orig_ctx_text = state.get(_ORIG_CTX) or state.get(_ctx_key(state), "")
+        history_internal = state.get("history", {}).get("internal", [])
+        # Count every turn (user + assistant) — this is the "chat history" portion
+        history_text = "\n".join(
+            f"{(u or '').strip()}\n{(a or '').strip()}"
+            for u, a in history_internal if u or a
+        )
+        context_tokens = _count_tokens(orig_ctx_text) + _count_tokens(history_text)
+        interval = max(1, int(params.get("auto_summary_interval", 8000)))
+
+        should_summarise = False
+        with _summary_lock:
+            cs = _summary_char_state.setdefault(
+                char, {"tokens": 0, "last_turn": 0, "last_ctx_tokens": 0}
+            )
+            last_ctx = cs.get("last_ctx_tokens", 0)
+            # Fire when context exceeds the threshold AND has grown meaningfully
+            # since the last summary (avoids re-triggering every turn once large).
+            growth_needed = max(100, interval // 4)
+            if context_tokens >= interval and (context_tokens - last_ctx) >= growth_needed:
+                should_summarise = True
+                cs["last_ctx_tokens"] = context_tokens
+
+        if should_summarise:
+            yield "*(📖 Summarizing story so far… please wait.)*"
+            history_snapshot = copy.deepcopy(state.get("history", {}))
+            _run_summary_inline(history_snapshot, char, _base_gen)
+    # ──────────────────────────────────────────────────────────────────────────
+
     if params["activate"] and _active_lorebooks:
         pref = params["injection_prefix"]
         suf  = params["injection_suffix"]
@@ -873,27 +923,6 @@ def custom_generate_reply(question, original_question, state,
             final_reply = chunk
             yield chunk
 
-        if (is_chat
-                and params.get("auto_summary_enabled")
-                and params.get("activate")
-                and _active_lorebooks):
-            char = _char_stem(state)
-            reply_tokens = _count_tokens(final_reply)
-            interval = max(1, int(params.get("auto_summary_interval", 8000)))
-            should_summarise = False
-            with _summary_lock:
-                cs = _summary_char_state.setdefault(char, {"tokens": 0, "last_turn": 0})
-                cs["tokens"] += reply_tokens
-                if cs["tokens"] >= interval:
-                    cs["tokens"] = 0
-                    should_summarise = True
-
-            if should_summarise:
-                _ensure_summary_lorebook(char)
-                yield final_reply + _SUMMARY_PENDING_SUFFIX
-                history_snapshot = copy.deepcopy(state.get("history", {}))
-                _run_summary_inline(history_snapshot, char, _base_gen)
-                yield final_reply
         return
 
     max_ints = max(0, int(params["max_interrupts"]))
@@ -952,27 +981,6 @@ def custom_generate_reply(question, original_question, state,
     injected_eids = {_eid(e) for e in last_trimmed}
     budget_dropped = [e for e in all_injected_entries if _eid(e) not in injected_eids]
     _update_injection_preview(last_trimmed, interrupts, notebook=not is_chat, budget_dropped=budget_dropped)
-
-    if (is_chat
-            and params.get("auto_summary_enabled")
-            and params.get("activate")
-            and _active_lorebooks):
-        char = _char_stem(state)
-        reply_tokens = _count_tokens(cumulative_text)
-        interval = max(1, int(params.get("auto_summary_interval", 8000)))
-        should_summarise = False
-        with _summary_lock:
-            cs = _summary_char_state.setdefault(char, {"tokens": 0, "last_turn": 0})
-            cs["tokens"] += reply_tokens
-            if cs["tokens"] >= interval:
-                cs["tokens"] = 0
-                should_summarise = True
-
-        if should_summarise:
-            _ensure_summary_lorebook(char)
-            yield cumulative_text + _SUMMARY_PENDING_SUFFIX
-            history_snapshot = copy.deepcopy(state.get("history", {}))
-            _run_summary_inline(history_snapshot, char, _base_gen)
 
     yield cumulative_text
 
@@ -1202,7 +1210,17 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
         prompt = _build_delta_summary_prompt(previous_summary, history_snapshot, last_turn)
         mode_label = f"delta (+{current_turn_count - last_turn} turns)"
 
-    summary_state = dict(
+    # Build a complete state by starting from the webui's own default settings so
+    # that any new sampler keys added by future webui updates are automatically
+    # present.  We then override only the values we actually care about for
+    # summarisation.
+    try:
+        import modules.shared as _shared
+        summary_state = copy.deepcopy(_shared.settings)
+    except Exception:
+        summary_state = {}
+
+    summary_state.update(dict(
         max_new_tokens=int(params.get("auto_summary_max_new_tokens", 512)),
         auto_max_new_tokens=False,
         max_tokens_second=0,
@@ -1217,15 +1235,21 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
         encoder_repetition_penalty=1, no_repeat_ngram_size=0,
         penalty_alpha=0, guidance_scale=1,
         mirostat_mode=0, mirostat_tau=5, mirostat_eta=0.1,
+        top_n_sigma=0, adaptive_target=0, adaptive_decay=0,
+        presence_penalty=0, frequency_penalty=0,
+        dry_multiplier=0, dry_base=1.75, dry_allowed_length=2, dry_sequence_breakers='["\\n", ":", "\\"", "*"]',
+        xtc_probability=0, xtc_threshold=0.1,
+        grammar_string="",
         do_sample=True, seed=-1,
         add_bos_token=True, ban_eos_token=False,
         skip_special_tokens=True,
-        custom_stopping_strings="",
+        custom_stopping_strings="", custom_token_bans="",
         truncation_length=4096,
-        mode="chat",
+        mode="instruct",
         custom_system_message="", context="",
         history={"internal": [], "visible": []},
-    )
+        stream=True,
+    ))
 
     stopping = ["[User]:", "\n\n[User]:", "\n\n[Assistant]:"]
     summary = ""
@@ -2181,36 +2205,51 @@ def ui():
     auto_summary_history_n.change(   lambda x: _safe_int("auto_summary_history_turns",  x), [auto_summary_history_n],   None)
 
     def _do_force_summary():
-        """Manually trigger a full re-summarise from the UI (ignores token counter,
-        resets last_turn to 0 so the entire history is processed fresh)."""
+        """Manually trigger a full re-summarise from the UI.
+
+        This is a Gradio generator so it yields a 'working…' status immediately
+        (clearing the spinner from the previous state) and then yields the final
+        result once the (blocking) summary generation is done.
+        """
         global _summary_status
         if not _active_summary_stem:
-            return gr.update(value="⚠ No active character summary lorebook found. Start a chat first.")
+            yield gr.update(value="⚠ No active character summary lorebook found. Start a chat first.")
+            return
 
         char = _active_summary_stem[len(_SUMMARY_LB_PREFIX):]
 
         try:
             import modules.shared as shared
             from modules.text_generation import generate_reply_HF, generate_reply_custom
-            def _force_base_gen(q, oq, st):
+            def _force_base_gen(q, oq, st, stopping_strings=None, is_chat=None):
+                _stops = stopping_strings or []
+                _ic    = bool(is_chat)
                 if shared.model.__class__.__name__ in ["LlamaServer", "Exllamav3Model", "TensorRTLLMModel"]:
-                    yield from generate_reply_custom(q, oq, st, [], is_chat=False)
+                    yield from generate_reply_custom(q, oq, st, _stops, is_chat=_ic)
                 else:
-                    yield from generate_reply_HF(q, oq, st, [], is_chat=False)
+                    yield from generate_reply_HF(q, oq, st, _stops, is_chat=_ic)
         except Exception as exc:
-            return gr.update(value=f"❌ Could not load generation modules: {exc}")
+            yield gr.update(value=f"❌ Could not load generation modules: {exc}")
+            return
 
         with _summary_lock:
-            _summary_char_state[char] = {"tokens": 0, "last_turn": 0}
+            _summary_char_state[char] = {"tokens": 0, "last_turn": 0, "last_ctx_tokens": 0}
 
-        _run_summary_inline({}, char, _force_base_gen, force_full=True)
-        return gr.update(value=_summary_status)
+        _summary_status = "⏳ Generating story summary…"
+        yield gr.update(value=_summary_status)   # show spinner status right away
+
+        # Use the last history snapshot captured during generation; fall back to
+        # an empty dict if the user clicks Force before any generation has run.
+        with _last_seen_history_lock:
+            history_snapshot = copy.deepcopy(_last_seen_history.get(char, {}))
+
+        _run_summary_inline(history_snapshot, char, _force_base_gen, force_full=True)
+        yield gr.update(value=_summary_status)   # show final result
 
     def _refresh_summary_status():
         return gr.update(value=_summary_status or "*No summary generated yet this session.*")
 
-    auto_summary_trigger_btn.click(_do_force_summary,      [], [auto_summary_status_md])
-    auto_summary_status_md.change( _refresh_summary_status, [], [auto_summary_status_md])
+    auto_summary_trigger_btn.click(_do_force_summary, [], [auto_summary_status_md])
 
     st_import_btn.click(_do_st_import, [st_import_file],
                         [st_import_status, lb_dropdown, active_pills,
