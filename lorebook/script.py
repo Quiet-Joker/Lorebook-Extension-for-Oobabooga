@@ -36,9 +36,59 @@ params = {
     "position_override_value": "after_context",
     "chat_only_scan": False,
     "auto_summary_enabled": False,
-    "auto_summary_interval": 8000,                                      
+    "auto_summary_interval": 8000,
     "auto_summary_max_new_tokens": 512,
-    "auto_summary_history_turns": 40,                                                 
+    "auto_summary_history_turns": 40,
+    "auto_summary_full_prompt": (
+        "You are a meticulous story chronicler. Your task is to write a detailed, "
+        "chronological summary of an ongoing collaborative roleplay story based on "
+        "the conversation transcript below.\n\n"
+        "Your summary MUST include, in order:\n"
+        "1. The setting and situation at the start of the story.\n"
+        "2. Every significant event that has occurred, listed chronologically.\n"
+        "3. Every decision made by the user/player and the direct consequences of "
+        "those decisions.\n"
+        "4. Key character moments: emotions, relationships, rivalries, alliances.\n"
+        "5. Important world details, locations, and lore that have been established.\n"
+        "6. Any unresolved plot threads, mysteries, or pending choices.\n\n"
+        "Rules:\n"
+        "- Write in plain, dense prose. No bullet points, no headers.\n"
+        "- Be specific — use character names, place names, and exact events.\n"
+        "- Do NOT editorialize or add your own commentary.\n"
+        "- Do NOT start with 'Sure', 'Here is', or any preamble. "
+        "Begin the summary immediately.\n\n"
+        "--- STORY TRANSCRIPT ---\n"
+        "{conversation}\n"
+        "--- END TRANSCRIPT ---\n\n"
+        "Detailed chronological story summary:"
+    ),
+    "auto_summary_delta_prompt": (
+        "You are a meticulous story chronicler maintaining a running summary of "
+        "an ongoing collaborative roleplay.\n\n"
+        "Below is the EXISTING summary of the story up to a certain point, "
+        "followed by the NEW events that have happened since then.\n\n"
+        "Your task: rewrite the summary to incorporate the new events. "
+        "Preserve everything important from the existing summary. "
+        "Add the new events in chronological order at the end.\n\n"
+        "Include:\n"
+        "- Every significant event in chronological order.\n"
+        "- Every decision made by the user/player and its consequences.\n"
+        "- Key character moments, relationships, and emotional beats.\n"
+        "- Important world details, lore, and locations established.\n"
+        "- All unresolved plot threads, mysteries, and pending choices.\n\n"
+        "Rules:\n"
+        "- Write in plain, dense prose. No bullet points, no headers.\n"
+        "- Be specific — use character names, place names, exact events.\n"
+        "- Do NOT editorialize. Do NOT start with 'Sure' or any preamble.\n"
+        "- Begin the updated summary immediately.\n\n"
+        "--- EXISTING SUMMARY ---\n"
+        "{previous_summary}\n"
+        "--- END EXISTING SUMMARY ---\n\n"
+        "--- NEW EVENTS ---\n"
+        "{new_events}\n"
+        "--- END NEW EVENTS ---\n\n"
+        "Updated story summary:"
+    ),
 }
 
 _MAX_GATHER_DEPTH = 20
@@ -54,7 +104,7 @@ _PARAMS_PERSIST_KEYS = {
     "max_interrupts", "position_override_enabled", "position_override_value",
     "chat_only_scan",
     "auto_summary_enabled", "auto_summary_interval", "auto_summary_max_new_tokens",
-    "auto_summary_history_turns",
+    "auto_summary_history_turns", "auto_summary_full_prompt", "auto_summary_delta_prompt",
 }
 
 current_lorebook: dict | None = None
@@ -556,6 +606,17 @@ def state_modifier(state):
         state[_ORIG_CTX] = _strip_wi_block(state.get(ctx_k, ""))
     state[_HIST_MSGS] = _gather_messages_list(state.get("history", {}), state[_ORIG_CTX])
 
+    # Ensure the auto-summary lorebook exists and is active BEFORE the
+    # _active_lorebooks guard so the feature works even when no other lorebook
+    # is manually turned on.  Without this, state_modifier would bail out on
+    # the early-exit below and _ensure_summary_lorebook would never run,
+    # keeping _active_lorebooks perpetually empty.
+    if params.get("auto_summary_enabled") and params.get("activate"):
+        try:
+            _ensure_summary_lorebook(_char_stem(state))
+        except Exception:
+            pass
+
     if not params["activate"] or not _active_lorebooks:
         return state
     internal = state.get("history", {}).get("internal", [])
@@ -565,11 +626,6 @@ def state_modifier(state):
     if not last_user or last_user == "<|BEGIN-VISIBLE-CHAT|>":
         return state
 
-    if params.get("auto_summary_enabled") and params.get("activate"):
-        try:
-            _ensure_summary_lorebook(_char_stem(state))
-        except Exception:
-            pass
     _regen_matched, _regen_all = _do_wi_injection(last_user, state[_HIST_MSGS], state)
     state["_lb_chat_matched"]     = _regen_matched or []
     state["_lb_chat_all_matched"] = _regen_all     or []
@@ -856,10 +912,11 @@ def custom_generate_reply(question, original_question, state,
                 char, {"tokens": 0, "last_turn": 0, "last_ctx_tokens": 0}
             )
             last_ctx = cs.get("last_ctx_tokens", 0)
-            # Fire when context exceeds the threshold AND has grown meaningfully
-            # since the last summary (avoids re-triggering every turn once large).
-            growth_needed = max(100, interval // 4)
-            if context_tokens >= interval and (context_tokens - last_ctx) >= growth_needed:
+            # First summary: fire once total context reaches the interval.
+            # Subsequent summaries: only fire after another full interval of NEW
+            # tokens has accumulated since the last summary was written.
+            next_threshold = interval if last_ctx == 0 else last_ctx + interval
+            if context_tokens >= next_threshold:
                 should_summarise = True
                 cs["last_ctx_tokens"] = context_tokens
 
@@ -1102,29 +1159,8 @@ def _build_full_summary_prompt(history_snapshot: dict) -> str:
         if a:
             lines.append(f"[Assistant]: {a}")
     convo = "\n".join(lines)
-    return (
-        "You are a meticulous story chronicler. Your task is to write a detailed, "
-        "chronological summary of an ongoing collaborative roleplay story based on "
-        "the conversation transcript below.\n\n"
-        "Your summary MUST include, in order:\n"
-        "1. The setting and situation at the start of the story.\n"
-        "2. Every significant event that has occurred, listed chronologically.\n"
-        "3. Every decision made by the user/player and the direct consequences of "
-        "those decisions.\n"
-        "4. Key character moments: emotions, relationships, rivalries, alliances.\n"
-        "5. Important world details, locations, and lore that have been established.\n"
-        "6. Any unresolved plot threads, mysteries, or pending choices.\n\n"
-        "Rules:\n"
-        "- Write in plain, dense prose. No bullet points, no headers.\n"
-        "- Be specific — use character names, place names, and exact events.\n"
-        "- Do NOT editorialize or add your own commentary.\n"
-        "- Do NOT start with 'Sure', 'Here is', or any preamble. "
-        "Begin the summary immediately.\n\n"
-        "--- STORY TRANSCRIPT ---\n"
-        f"{convo}\n"
-        "--- END TRANSCRIPT ---\n\n"
-        "Detailed chronological story summary:"
-    )
+    template = params.get("auto_summary_full_prompt", "")
+    return template.replace("{conversation}", convo)
 
 
 def _build_delta_summary_prompt(previous_summary: str,
@@ -1137,9 +1173,9 @@ def _build_delta_summary_prompt(previous_summary: str,
     that incorporates the new events without re-inventing what came before.
     """
     all_turns = history_snapshot.get("internal", [])
-    new_turns = all_turns[last_turn:]                                          
+    new_turns = all_turns[last_turn:]
     max_new = int(params.get("auto_summary_history_turns", 40))
-    new_turns = new_turns[-max_new:]                                             
+    new_turns = new_turns[-max_new:]
 
     lines = []
     for u, a in new_turns:
@@ -1151,42 +1187,17 @@ def _build_delta_summary_prompt(previous_summary: str,
             lines.append(f"[Assistant]: {a}")
     new_convo = "\n".join(lines)
 
-    return (
-        "You are a meticulous story chronicler maintaining a running summary of "
-        "an ongoing collaborative roleplay.\n\n"
-        "Below is the EXISTING summary of the story up to a certain point, "
-        "followed by the NEW events that have happened since then.\n\n"
-        "Your task: rewrite the summary to incorporate the new events. "
-        "Preserve everything important from the existing summary. "
-        "Add the new events in chronological order at the end.\n\n"
-        "Include:\n"
-        "- Every significant event in chronological order.\n"
-        "- Every decision made by the user/player and its consequences.\n"
-        "- Key character moments, relationships, and emotional beats.\n"
-        "- Important world details, lore, and locations established.\n"
-        "- All unresolved plot threads, mysteries, and pending choices.\n\n"
-        "Rules:\n"
-        "- Write in plain, dense prose. No bullet points, no headers.\n"
-        "- Be specific — use character names, place names, exact events.\n"
-        "- Do NOT editorialize. Do NOT start with 'Sure' or any preamble.\n"
-        "- Begin the updated summary immediately.\n\n"
-        "--- EXISTING SUMMARY ---\n"
-        f"{previous_summary}\n"
-        "--- END EXISTING SUMMARY ---\n\n"
-        "--- NEW EVENTS ---\n"
-        f"{new_convo}\n"
-        "--- END NEW EVENTS ---\n\n"
-        "Updated story summary:"
-    )
+    template = params.get("auto_summary_delta_prompt", "")
+    return template.replace("{previous_summary}", previous_summary).replace("{new_events}", new_convo)
 
 
 def _run_summary_inline(history_snapshot: dict, char_stem: str,
-                        base_gen_fn, force_full: bool = False) -> str:
+                        base_gen_fn=None, force_full: bool = False) -> str:
     """Run one summary generation pass and write the result to the lorebook.
 
-    Called synchronously inside custom_generate_reply.  mid-gen interrupt is
-    intentionally bypassed — base_gen_fn is called directly with a clean state
-    that has no lorebook state attached.
+    Called synchronously inside custom_generate_reply or from the Force button.
+    The model is called directly (bypassing text-generation-webui template
+    wrapping) so the raw prompt is sent as-is.
 
     If force_full is True (e.g. "Force summary now" button), a full re-summarise
     is performed regardless of whether a previous summary exists.
@@ -1245,7 +1256,12 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
         skip_special_tokens=True,
         custom_stopping_strings="", custom_token_bans="",
         truncation_length=4096,
-        mode="instruct",
+        # Use "chat" mode (not "instruct") so no instruct template is applied.
+        # In text-completion mode (is_chat=False below) the mode is ignored by
+        # the generator, but leaving it as "instruct" causes some backends to
+        # apply the instruct template to the empty history and produce a
+        # near-empty prompt shell (~31 tokens) instead of the real prompt.
+        mode="chat",
         custom_system_message="", context="",
         history={"internal": [], "visible": []},
         stream=True,
@@ -1254,9 +1270,63 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
     stopping = ["[User]:", "\n\n[User]:", "\n\n[Assistant]:"]
     summary = ""
     try:
-        for chunk in base_gen_fn(prompt, prompt, summary_state,
-                                 stopping_strings=stopping, is_chat=False):
-            summary = chunk
+        import modules.shared as _shared
+
+        if _shared.model.__class__.__name__ == "LlamaServer":
+            # generate_with_streaming(prompt, state) is the right call:
+            # it tokenizes `prompt` directly into token IDs and POSTs them to
+            # /completion — no instruct template is ever applied here.
+            #
+            # Previous attempts failed because:
+            # • generate_reply_custom/HF rebuild the prompt from state history
+            #   (ignoring the `question` arg) → produced ~30-token template shell
+            # • Direct REST calls used getattr(model, "url") which doesn't exist
+            #   on LlamaServer, fell back to port 8080 (wrong port), and either
+            #   hit nothing or the ooba API server
+            #
+            # The real killer was prepare_payload() doing state["sampler_priority"]
+            # (direct key access).  If that key was absent from summary_state, a
+            # silent KeyError was swallowed by the outer except, summary stayed "",
+            # and the 30-token log was from the *normal* chat generation that ran
+            # immediately after.
+
+            # Ensure every key prepare_payload() accesses by direct [] lookup is
+            # present so it can't KeyError silently.
+            summary_state.setdefault("sampler_priority", "")
+            summary_state.setdefault("logit_bias", {})
+            summary_state.setdefault("logprobs", 0)
+
+            full_text = ""
+            for chunk in _shared.model.generate_with_streaming(prompt, summary_state):
+                full_text = chunk
+                for stop in stopping:
+                    if stop in full_text:
+                        full_text = full_text[:full_text.index(stop)]
+                        break
+                else:
+                    continue
+                break
+            summary = full_text
+
+        else:
+            # HF / ExLlama / other backends: generate_reply_HF with is_chat=False
+            # sends the raw prompt in text-completion mode without template wrapping.
+            from modules.text_generation import generate_reply_HF
+
+            final_chunk = ""
+            for chunk in generate_reply_HF(
+                prompt, prompt, summary_state, stopping, is_chat=False
+            ):
+                final_chunk = chunk
+
+            # Some backends echo the prompt back; strip it before checking stops.
+            generated = final_chunk[len(prompt):] if final_chunk.startswith(prompt) else final_chunk
+            for stop in stopping:
+                if stop in generated:
+                    generated = generated[:generated.index(stop)]
+                    break
+            summary = generated
+
     except Exception as exc:
         _summary_status = f"❌ Summary error: {exc}"
         return ""
@@ -1265,9 +1335,15 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
     if summary:
         _update_summary_entry(char_stem, summary)
         with _summary_lock:
+            # Preserve last_ctx_tokens so the interval threshold keeps
+            # advancing correctly.  Overwriting the whole dict (as before)
+            # dropped that key, which reset the threshold to zero and caused
+            # the summary to re-fire on every subsequent turn.
+            prev = _summary_char_state.get(char_stem, {})
             _summary_char_state[char_stem] = {
                 "tokens": 0,
                 "last_turn": current_turn_count,
+                "last_ctx_tokens": prev.get("last_ctx_tokens", 0),
             }
         tok = _count_tokens(summary)
         _summary_status = (
@@ -1732,6 +1808,29 @@ def ui():
                     auto_summary_trigger_btn = gr.Button(
                         "Force summary now", variant="secondary", elem_classes="refresh-button",
                     )
+                    with gr.Accordion("Summary prompt templates", open=False, elem_classes="tgw-accordion"):
+                        gr.Markdown(
+                            "**Full summary prompt** — used the first time, or when *Force summary now* is pressed. "
+                            "Use `{conversation}` where the story transcript should be inserted."
+                        )
+                        auto_summary_full_prompt_ta = gr.Textbox(
+                            label="Full summary prompt",
+                            value=params["auto_summary_full_prompt"],
+                            lines=14,
+                            max_lines=30,
+                            show_label=False,
+                        )
+                        gr.Markdown(
+                            "**Delta (update) prompt** — used when a previous summary already exists. "
+                            "Use `{previous_summary}` and `{new_events}` as placeholders."
+                        )
+                        auto_summary_delta_prompt_ta = gr.Textbox(
+                            label="Delta summary prompt",
+                            value=params["auto_summary_delta_prompt"],
+                            lines=14,
+                            max_lines=30,
+                            show_label=False,
+                        )
 
                 with gr.Tab("Import / Export"):
                     gr.Markdown("#### Import from SillyTavern")
@@ -2203,14 +2302,11 @@ def ui():
     auto_summary_interval_n.change(  lambda x: _safe_int("auto_summary_interval",       x), [auto_summary_interval_n],  None)
     auto_summary_max_tokens_n.change(lambda x: _safe_int("auto_summary_max_new_tokens", x), [auto_summary_max_tokens_n],None)
     auto_summary_history_n.change(   lambda x: _safe_int("auto_summary_history_turns",  x), [auto_summary_history_n],   None)
+    auto_summary_full_prompt_ta.change( lambda x: _set_param("auto_summary_full_prompt",  x), [auto_summary_full_prompt_ta],  None)
+    auto_summary_delta_prompt_ta.change(lambda x: _set_param("auto_summary_delta_prompt", x), [auto_summary_delta_prompt_ta], None)
 
     def _do_force_summary():
-        """Manually trigger a full re-summarise from the UI.
-
-        This is a Gradio generator so it yields a 'working…' status immediately
-        (clearing the spinner from the previous state) and then yields the final
-        result once the (blocking) summary generation is done.
-        """
+        """Manually trigger a full re-summarise from the UI."""
         global _summary_status
         if not _active_summary_stem:
             yield gr.update(value="⚠ No active character summary lorebook found. Start a chat first.")
@@ -2218,33 +2314,17 @@ def ui():
 
         char = _active_summary_stem[len(_SUMMARY_LB_PREFIX):]
 
-        try:
-            import modules.shared as shared
-            from modules.text_generation import generate_reply_HF, generate_reply_custom
-            def _force_base_gen(q, oq, st, stopping_strings=None, is_chat=None):
-                _stops = stopping_strings or []
-                _ic    = bool(is_chat)
-                if shared.model.__class__.__name__ in ["LlamaServer", "Exllamav3Model", "TensorRTLLMModel"]:
-                    yield from generate_reply_custom(q, oq, st, _stops, is_chat=_ic)
-                else:
-                    yield from generate_reply_HF(q, oq, st, _stops, is_chat=_ic)
-        except Exception as exc:
-            yield gr.update(value=f"❌ Could not load generation modules: {exc}")
-            return
-
         with _summary_lock:
             _summary_char_state[char] = {"tokens": 0, "last_turn": 0, "last_ctx_tokens": 0}
 
         _summary_status = "⏳ Generating story summary…"
-        yield gr.update(value=_summary_status)   # show spinner status right away
+        yield gr.update(value=_summary_status)
 
-        # Use the last history snapshot captured during generation; fall back to
-        # an empty dict if the user clicks Force before any generation has run.
         with _last_seen_history_lock:
             history_snapshot = copy.deepcopy(_last_seen_history.get(char, {}))
 
-        _run_summary_inline(history_snapshot, char, _force_base_gen, force_full=True)
-        yield gr.update(value=_summary_status)   # show final result
+        _run_summary_inline(history_snapshot, char, None, force_full=True)
+        yield gr.update(value=_summary_status)
 
     def _refresh_summary_status():
         return gr.update(value=_summary_status or "*No summary generated yet this session.*")
