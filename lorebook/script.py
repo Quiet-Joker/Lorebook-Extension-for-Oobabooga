@@ -1031,9 +1031,10 @@ def ui():
                     elem_classes="slim-dropdown", scale=4, interactive=True,
                     info="All .json files in the lorebooks/ folder.",
                 )
-                lb_new_btn    = gr.Button("New",    elem_classes="refresh-button")
-                lb_save_btn   = gr.Button("Save",   variant="primary", elem_classes="lb-btn-primary refresh-button")
-                lb_delete_btn = gr.Button("Delete", variant="stop",    elem_classes="lb-btn-danger refresh-button")
+                lb_new_btn     = gr.Button("New",     elem_classes="refresh-button")
+                lb_save_btn    = gr.Button("Save",    variant="primary", elem_classes="lb-btn-primary refresh-button")
+                lb_delete_btn  = gr.Button("Delete",  variant="stop",    elem_classes="lb-btn-danger refresh-button")
+                lb_refresh_btn = gr.Button("🔄",      elem_classes="refresh-button", scale=0)
 
             lb_name_input = gr.Textbox(
                 label="Name", placeholder="My Fantasy World",
@@ -1594,6 +1595,10 @@ def ui():
     # Lorebook file management
     lb_dropdown.change(_do_load,   [lb_dropdown], [lb_name_input, lb_desc_input, lb_status, entry_radio])
     lb_new_btn.click(  _do_new_lb, [],            [lb_name_input, lb_desc_input, lb_status, entry_radio])
+    lb_refresh_btn.click(
+        lambda: gr.update(choices=get_lorebook_files()),
+        [], [lb_dropdown]
+    )
 
     lb_save_btn.click(
         _do_save_lb_and_refresh, [lb_name_input, lb_desc_input],
