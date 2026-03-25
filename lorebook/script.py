@@ -35,15 +35,10 @@ params = {
     "position_override_enabled": False,
     "position_override_value": "after_context",
     "chat_only_scan": False,
-    # ── Auto-summary ──────────────────────────────────────────────────────────
-    # When enabled, every `auto_summary_interval` tokens of generated output the
-    # model is asked to write a running story summary. That summary is stored in a
-    # constant lorebook entry ("📖 Story Summary") in the first active lorebook,
-    # so it gets injected into every subsequent turn automatically.
     "auto_summary_enabled": False,
-    "auto_summary_interval": 8000,    # tokens between summary refreshes
+    "auto_summary_interval": 8000,                                      
     "auto_summary_max_new_tokens": 512,
-    "auto_summary_history_turns": 40, # how many recent turns to include in the prompt
+    "auto_summary_history_turns": 40,                                                 
 }
 
 _MAX_GATHER_DEPTH = 20
@@ -53,8 +48,6 @@ _ACTIVE_STATE_FILE = EXT_DIR / "active_state.json"
 _PARAMS_FILE       = EXT_DIR / "params.json"
 LOREBOOKS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Keys that are user-configurable and should survive restarts.
-# Internal/session keys (is_tab, display_name, current_lorebook) are excluded.
 _PARAMS_PERSIST_KEYS = {
     "activate", "scan_depth", "token_budget", "injection_prefix", "injection_suffix",
     "constant_entries", "recursive_scan", "max_recursion_steps", "mid_gen_interrupt",
@@ -78,51 +71,30 @@ _last_injection_info: dict = {"entries": [], "interrupts": 0, "total_tokens": 0}
 _last_notebook_injection_lock = threading.Lock()
 _last_notebook_injection_info: dict = {"entries": [], "interrupts": 0, "total_tokens": 0}
 
-# Per-session injection history (newest first, capped at 60 turns each).
-# Tracks new / repeat / returned / dropped status across turns so the UI
-# can show a full audit trail of what fired and when.
 _injection_history_lock = threading.Lock()
-_injection_history: list = []           # chat / instruct
-_injection_history_notebook: list = []  # notebook
-_prev_chat_labels: set = set()          # labels fired last chat turn
+_injection_history: list = []                            
+_injection_history_notebook: list = []            
+_prev_chat_labels: set = set()                                       
 _prev_notebook_labels: set = set()
-_all_chat_labels: set = set()           # every label ever fired this session (chat)
+_all_chat_labels: set = set()                                                       
 _all_notebook_labels: set = set()
 _chat_turn_counter: int = 0
 _notebook_turn_counter: int = 0
 
-# FIX #10: A dedicated lock for all mutations to the global lorebook state
-# (current_lorebook, _next_uid, _active_lorebooks). The original only locked
-# _last_injection_info, leaving the rest unprotected across concurrent Gradio events.
-_state_lock = threading.RLock()  # RLock so _save_active_state can be called from inside locked blocks
+_state_lock = threading.RLock()                                                                       
 
-# ── Auto-summary state ────────────────────────────────────────────────────────
-_AUTO_SUMMARY_LABEL    = "📖 Story Summary"  # comment field value for the managed entry
-_SUMMARY_LB_PREFIX     = "_summary_"         # lorebook filename prefix for auto-summary books
+_AUTO_SUMMARY_LABEL    = "📖 Story Summary"                                             
+_SUMMARY_LB_PREFIX     = "_summary_"                                                          
 _summary_lock          = threading.Lock()
-_summary_status: str   = ""                  # shown in the UI status line
+_summary_status: str   = ""                                               
 
-# Per-character counters and turn-tracking, keyed by character_stem.
-# Each value is a dict:  {"tokens": int, "last_turn": int}
-# "tokens"    — generated tokens accumulated since the last summary for this character.
-# "last_turn" — len(history["internal"]) at the time of the last summary.
-#               0 means "never summarized" → do a full summarize next time.
 _summary_char_state: dict = {}
 
-_active_summary_stem: str = ""   # stem of the currently loaded per-character summary lorebook
+_active_summary_stem: str = ""                                                                
 
 _ST_SELECTIVE_INT_TO_STR = {0: "AND ANY", 1: "NOT ALL", 2: "NOT ANY", 3: "AND ALL"}
 _ST_SELECTIVE_STR_TO_INT = {v: k for k, v in _ST_SELECTIVE_INT_TO_STR.items()}
-# FIX #1: In SillyTavern, position 0 = before_context, 1 = after_context, 2 = AT_DEPTH.
-# The original had 0 and 1 swapped. Key 2 (AT_DEPTH) now maps to before_reply — our new
-# "Between User and Assistant" mode — since AT_DEPTH=0 in ST is the closest equivalent
-# (inject just before the last reply at depth 0).
 _ST_POSITION = {0: "before_context", 1: "after_context", 2: "before_reply"}
-# FIX 3: Was {"after_context": 0, "before_context": 1} which is the inverse of _ST_POSITION,
-# causing all exported entries to have their positions flipped on round-trip.
-# before_reply and notebook both export as ST position 2 (AT_DEPTH) — no direct ST
-# equivalent exists for either. On re-import they'll come back as before_reply, which
-# is the closest semantic match. Users should re-set to notebook manually if needed.
 _OUR_POSITION = {"before_context": 0, "after_context": 1, "before_reply": 2, "notebook": 2}
 
 
@@ -151,7 +123,6 @@ def save_lorebook_file(stem, data):
         return False
 
 def delete_lorebook_file(stem):
-    # FIX #12: Wrap unlink in try/except so filesystem errors don't bubble up as unhandled exceptions.
     path = LOREBOOKS_DIR / f"{stem}.json"
     if path.exists():
         try:
@@ -218,8 +189,6 @@ def import_from_sillytavern(raw_bytes):
         comment = e.get("name") or e.get("comment") or ""
         enabled = bool(e["enabled"]) if "enabled" in e else not bool(e.get("disable", False))
         position = _ST_POSITION.get(e.get("position", 0), "after_context")
-        # FIX #4: Use explicit None checks so 0 is preserved as a valid value.
-        # The original used `or` chains which turned priority=0 into 10.
         _prio_raw = next((e.get(k) for k in ("insertion_order", "order", "priority") if e.get(k) is not None), None)
         priority = _prio_raw if _prio_raw is not None else 10
         _depth_raw = next((e.get(k) for k in ("depth", "scan_depth") if e.get(k) is not None), None)
@@ -241,9 +210,6 @@ def import_from_sillytavern(raw_bytes):
             "selective_logic": sel_logic,
             "content": e.get("content", ""),
             "case_sensitive": bool(e.get("case_sensitive", False)),
-            # FIX 6: Read match_whole_words and use_regex from source data rather than
-            # hardcoding True/False. SillyTavern stores these as "extensions.regex" or
-            # "use_regex" / "match_whole_words". Fall back to safe defaults if absent.
             "match_whole_words": bool(e.get("match_whole_words", e.get("extensions", {}).get("match_whole_words", True))),
             "use_regex": bool(e.get("use_regex", e.get("extensions", {}).get("regex", False))),
             "priority": int(priority),
@@ -273,8 +239,6 @@ def export_to_sillytavern(lorebook):
         uid = e.get("uid", i)
         keys = e.get("keys", [])
         priority = e.get("priority", 10)
-        # FIX #3: Use explicit None check so scan_depth=0 is preserved on export.
-        # The original `or 4` turned a real 0 into 4.
         _raw_depth = e.get("scan_depth")
         depth = _raw_depth if _raw_depth is not None else 4
         enabled = e.get("enabled", True)
@@ -298,9 +262,6 @@ def export_to_sillytavern(lorebook):
             "addMemo": True, "excludeRecursion": True,
             "displayIndex": i,
             "case_sensitive": e.get("case_sensitive", False),
-            # FIX 6: Preserve match_whole_words and use_regex on export so the round-trip
-            # is lossless. Previously these were never written, so regex entries became
-            # whole-word non-regex entries after an import → export cycle.
             "match_whole_words": e.get("match_whole_words", True),
             "use_regex": e.get("use_regex", False),
             "depth": depth, "characterFilter": None,
@@ -340,9 +301,6 @@ def _gather_messages_list(history, orig_ctx=None):
         user_text = pair[0]
         if not user_text or user_text == "<|BEGIN-VISIBLE-CHAT|>":
             continue
-        # Drop any slot that contains the persona text so it can never trigger
-        # entries.  Only active when the user has turned on "Only trigger words
-        # in chat"; at all other times every slot is included as before.
         if ctx_strip and params.get("chat_only_scan") and ctx_strip in str(user_text):
             continue
         msgs.append(str(user_text))
@@ -363,10 +321,6 @@ def _hit_key(raw_key, text, entry):
     haystack = text if case else text.lower()
     needle = k if case else k.lower()
     if entry.get("match_whole_words", True):
-        # FIX #9: Replace \b with lookarounds. \b fails when the key starts or ends with
-        # punctuation because \b requires a word/non-word boundary, but punctuation is
-        # already non-word, so no boundary exists. (?<!\w)/(?!\w) check for the absence
-        # of an adjacent alphanumeric character, which works correctly regardless of punctuation.
         return bool(re.search(r'(?<!\w)' + re.escape(needle) + r'(?!\w)', haystack))
     return needle in haystack
 
@@ -375,9 +329,6 @@ def _entry_matches(current_text, history_msgs, entry):
     if not entry.get("enabled", True):
         return False
     prob = entry.get("probability", 100)
-    # FIX V: Clamp probability to 0–100 before the roll check. Without the clamp,
-    # a malformed entry with probability=150 satisfies `150 < 100 == False` and always
-    # fires, ignoring the intended probability entirely.
     prob = max(0, min(100, prob))
     if prob <= 0:
         return False
@@ -386,9 +337,6 @@ def _entry_matches(current_text, history_msgs, entry):
     keys = entry.get("keys", [])
     if not keys:
         return False
-    # FIX #2: Use explicit None check so scan_depth=0 ("current message only") is honoured.
-    # The original `entry.get("scan_depth") or ...` treated 0 as falsy and fell back to the
-    # global setting, making per-entry depth-0 entries impossible to use correctly.
     _entry_depth = entry.get("scan_depth")
     if _entry_depth is not None:
         depth = _entry_depth
@@ -442,9 +390,6 @@ def _trim_to_budget(entries):
             used += size
         else:
             truncated = copy.copy(e)
-            # FIX #11: Snap truncation back to the nearest word boundary so the AI
-            # doesn't receive half-words. rfind(' ') returns -1 if no space is found,
-            # in which case we fall back to the hard character limit.
             hard_cut = e["content"][:remaining]
             snap = hard_cut.rfind(' ')
             truncated["content"] = hard_cut[:snap] if snap > 0 else hard_cut
@@ -454,19 +399,6 @@ def _trim_to_budget(entries):
 
 
 def _all_active_entries():
-    # FIX 2: Snapshot _active_lorebooks under the lock before iterating. The mutation
-    # side is already locked (FIX A), but reads on the generation thread were not,
-    # leaving a window for "dictionary changed size during iteration" RuntimeErrors.
-    # FIX 4 (new): Deep-copy each lorebook so the generation thread owns its own
-    # entries list. Without this, _active_lorebooks[stem] and current_lorebook point
-    # to the same dict object, meaning UI-thread mutations (pop/append/replace on
-    # entries) can corrupt the list the generation thread is currently iterating —
-    # even though the dict snapshot itself is safe.
-    # FIX UID-COLLISION: UIDs are only unique within a single lorebook file. When
-    # multiple lorebooks are active, raw-UID deduplication across them causes entries
-    # with colliding UIDs to silently shadow each other — constant entries from one
-    # lorebook suppress trigger entries from another, or vice-versa. Stamp each entry
-    # with its lorebook stem so callers can use (stem, uid) as the composite key.
     with _state_lock:
         active_items = list(_active_lorebooks.items())
     active_lbs = [(stem, copy.deepcopy(lb)) for stem, lb in active_items]
@@ -529,8 +461,6 @@ def _find_active_matches(current_text, history_msgs):
             if _eid(e) in seen_eids:
                 continue
             prob = e.get("probability", 100)
-            # FIX B: Clamp probability here too. FIX V only patched _entry_matches;
-            # this inline check for constant entries had the same unclamped bug.
             prob = max(0, min(100, prob))
             if prob <= 0 or (prob < 100 and random.randint(1, 100) > prob):
                 continue
@@ -538,17 +468,12 @@ def _find_active_matches(current_text, history_msgs):
             matched_list.append(e)
 
     matched_list = _apply_inclusion_groups(matched_list)
-    # Sort by priority DESC; for ties use reverse discovery order so the last-triggered
-    # entry comes first into _trim_to_budget (gets the most budget) and ends up freshest
-    # (closest to reply) after the final reversal.  enumerate gives each entry its stable
-    # discovery index; negating it puts later-discovered entries first on ties.
     matched_list = [e for _, e in sorted(
         enumerate(matched_list),
         key=lambda pair: (pair[1].get("priority", 0), pair[0]),
         reverse=True,
     )]
     trimmed = _trim_to_budget(matched_list)
-    # Reverse so highest-priority / last-activated entry ends up closest to reply (freshest).
     return list(reversed(trimmed)), matched_list
 
 
@@ -566,9 +491,6 @@ def _format_injection(entries):
 def _strip_wi_block(ctx):
     pref = params["injection_prefix"]
     suf = params["injection_suffix"]
-    # FIX I (CRITICAL): Guard against empty prefix/suffix. In Python, "any_string".find("")
-    # always returns 0, so an empty pref/suf causes start=0 and end=0 every iteration,
-    # ctx never changes, and the while True loop spins forever, locking up the server.
     if not pref or not suf:
         return ctx
     while True:
@@ -593,18 +515,13 @@ def _do_wi_injection(scan_text, history_msgs, state):
     orig_ctx = state.get(_ORIG_CTX)
     ctx_k = _ctx_key(state)
     if orig_ctx is None:
-        # state_modifier may not have run (e.g. extension load order edge case).
-        # Compute the clean context on the fly rather than KeyError.
         orig_ctx = _strip_wi_block(state.get(ctx_k, ""))
         state[_ORIG_CTX] = orig_ctx
 
-    # "Only trigger words in chat" mode: strip the character persona from the current
-    # user message before scanning. History slots that contained the persona were already
-    # dropped at collection time by _gather_messages_list, so only scan_text needs cleaning.
     if params.get("chat_only_scan") and orig_ctx:
         scan_text = scan_text.replace(orig_ctx, "").strip()
     matched = _find_active_matches(scan_text, history_msgs)
-    matched, all_matched = matched  # unpack (injected_reversed, full_pre_budget_list)
+    matched, all_matched = matched                                                    
     matched = [e for e in matched if _eff_pos(e) != "notebook"]
     all_matched = [e for e in all_matched if _eff_pos(e) != "notebook"]
     if matched:
@@ -634,18 +551,8 @@ def state_modifier(state):
     ctx_k = _ctx_key(state)
     if _ORIG_CTX not in state:
         state[_ORIG_CTX] = _strip_wi_block(state.get(ctx_k, ""))
-    # Pass orig_ctx so persona slots are filtered out during collection when
-    # chat_only_scan is ON, rather than being stripped after the fact.
     state[_HIST_MSGS] = _gather_messages_list(state.get("history", {}), state[_ORIG_CTX])
 
-    # Regenerate fix: apply_extensions('chat_input') is only called by oobabooga inside
-    # `if not (regenerate or _continue)` in chatbot_wrapper, so chat_input_modifier
-    # never runs on regenerate. state_modifier IS called on every path, so we do the
-    # full WI scan here using the last user message from history — which on regenerate
-    # is always internal[-1][0] (the message the user already sent).
-    #
-    # On normal sends this result is immediately overwritten by chat_input_modifier
-    # (which runs next with the correct current text), so there is no conflict.
     if not params["activate"] or not _active_lorebooks:
         return state
     internal = state.get("history", {}).get("internal", [])
@@ -655,20 +562,11 @@ def state_modifier(state):
     if not last_user or last_user == "<|BEGIN-VISIBLE-CHAT|>":
         return state
 
-    # Auto-summary: ensure the per-character summary lorebook is active.
-    # This runs on every state_modifier call (cheap once the lorebook is loaded).
     if params.get("auto_summary_enabled") and params.get("activate"):
         try:
             _ensure_summary_lorebook(_char_stem(state))
         except Exception:
             pass
-    # FIX: On regenerate, chat_input_modifier never runs, so _lb_chat_matched /
-    # _lb_chat_all_matched are never written to state.  The mid_gen ON path in
-    # custom_generate_reply reads _cur_injected directly and is unaffected, but
-    # the mid_gen OFF early-return path reads state["_lb_chat_matched"] and
-    # gets [] every time — so the history showed nothing even when entries fired.
-    # Store the results here, mirroring what chat_input_modifier does on normal
-    # sends, so custom_generate_reply always has the data it needs.
     _regen_matched, _regen_all = _do_wi_injection(last_user, state[_HIST_MSGS], state)
     state["_lb_chat_matched"]     = _regen_matched or []
     state["_lb_chat_all_matched"] = _regen_all     or []
@@ -676,31 +574,14 @@ def state_modifier(state):
 
 
 def chat_input_modifier(text, visible_text, state):
-    # Only called on normal sends (not regenerate). Overwrites whatever state_modifier
-    # injected (which used the previous user message) with the correct current text.
     if not params["activate"] or not _active_lorebooks:
         global _cur_injected
         _cur_injected = set()
         return text, visible_text
-    # FIX 1 (CRITICAL): Do NOT make a local copy of state. Oobabooga reads the original
-    # state dict after this function returns. The previous `state = dict(state)` rebound
-    # the local name to a new dict, so all context mutations were silently discarded and
-    # lorebooks never actually injected anything into any prompt.
     history_msgs = state.get(_HIST_MSGS, _gather_messages_list(state.get("history", {}), state.get(_ORIG_CTX)))
     matched, all_matched = _do_wi_injection(text or "", history_msgs, state)
-    # Store both lists in state so custom_generate_reply can write the preview
-    # using is_chat, which is the only reliable signal for which UI tab is active.
-    # Writing the preview here (before is_chat is known) caused notebook generations
-    # to contaminate the chat store whenever an instruct template was loaded.
     state["_lb_chat_matched"]     = matched or []
     state["_lb_chat_all_matched"] = all_matched or []
-    # FIX IV: _cur_injected is read on the generation thread in custom_generate_reply.
-    # We don't need a lock around the set-comprehension itself (it's a single atomic
-    # rebind in CPython), but document the dependency here so it's explicit. The real
-    # protection is that custom_generate_reply immediately copies it: `already = set(_cur_injected)`,
-    # which is safe because set() construction from another set is atomic in CPython.
-    # For strict multi-interpreter safety the correct fix would be to pass it via state,
-    # but that requires oobabooga API changes outside this file's scope.
     return text, visible_text
 
 
@@ -710,7 +591,6 @@ def _find_new_trigger_entries(text, already_injected, notebook=False):
         eid = _eid(e)
         if eid in already_injected or not e.get("enabled", True) or e.get("constant"):
             continue
-        # In notebook mode only scan notebook-position entries; in chat mode skip them.
         pos = _eff_pos(e)
         if notebook and pos != "notebook":
             continue
@@ -720,12 +600,10 @@ def _find_new_trigger_entries(text, already_injected, notebook=False):
         if not keys:
             continue
         prob = e.get("probability", 100)
-        # FIX C: Same clamp as FIX V / FIX B — prob > 100 bypasses the roll otherwise.
         prob = max(0, min(100, prob))
         if prob <= 0 or (prob < 100 and random.randint(1, 100) > prob):
             continue
         if any(_hit_key(k, text, e) for k in keys):
-            # Honour secondary keys / selective logic — same as _entry_matches.
             sec = e.get("secondary_keys", [])
             logic = e.get("selective_logic", "AND ANY")
             if sec:
@@ -740,11 +618,7 @@ def _find_new_trigger_entries(text, already_injected, notebook=False):
                     continue
             newly.append(e)
     newly.sort(key=lambda e: e.get("priority", 0), reverse=True)
-    # FIX #8: Apply inclusion group filtering here too, consistent with _find_active_matches.
-    # Without this, two entries from the same group could both fire mid-generation.
     newly = _apply_inclusion_groups(newly)
-    # Apply the same (priority DESC, reverse-discovery) sort so equal-priority entries
-    # triggered later during generation end up freshest after budget trimming + reversal.
     newly = [e for _, e in sorted(
         enumerate(newly),
         key=lambda pair: (pair[1].get("priority", 0), pair[0]),
@@ -756,13 +630,9 @@ def _find_new_trigger_entries(text, already_injected, notebook=False):
 def _replace_world_info_block(prompt, all_entries):
     pref = params["injection_prefix"]
     suf = params["injection_suffix"]
-    # FIX I: Same empty-string guard as _strip_wi_block — avoid find("") == 0 logic errors.
     if not pref or not suf:
         return prompt, []
 
-    # Sort by priority DESC; for ties, later position in all_entries = more recently triggered
-    # = should be freshest.  Negate the index so later entries sort first (get most budget),
-    # then reverse at the end so they end up last (freshest) in injection order.
     trimmed = list(reversed(_trim_to_budget([e for _, e in sorted(
         enumerate(all_entries),
         key=lambda pair: (pair[1].get("priority", 0), pair[0]),
@@ -773,8 +643,6 @@ def _replace_world_info_block(prompt, all_entries):
     before_reply_entries = [e for e in trimmed if _eff_pos(e) == "before_reply"]
     notebook_entries     = [e for e in trimmed if _eff_pos(e) == "notebook"]
 
-    # FIX (Gemini #2): Strip ALL existing WI blocks then re-inject, so orphaned
-    # blocks from prior interrupts don't accumulate in the prompt.
     clean_prompt = _strip_wi_block(prompt)
 
     ctx = clean_prompt
@@ -782,9 +650,6 @@ def _replace_world_info_block(prompt, all_entries):
         block = (pref + _format_injection(before_entries) + suf).rstrip("\n") + "\n"
         ctx = block + ctx if ctx else block.lstrip("\n")
     if after_entries:
-        # FIX 3: Insert before the bot prefix line, not after it.
-        # rstrip trailing newlines so rfind finds the newline *before* the
-        # assistant header rather than the one that is part of it.
         block = (pref + _format_injection(after_entries) + suf).rstrip("\n")
         ctx_stripped = ctx.rstrip("\n")
         trailing     = ctx[len(ctx_stripped):]
@@ -794,10 +659,6 @@ def _replace_world_info_block(prompt, all_entries):
         else:
             ctx = block + "\n" + ctx_stripped + trailing
     if before_reply_entries:
-        # before_reply also lives just above the bot prefix — same insertion point as
-        # after_context during mid-gen, but semantically distinct: it belongs to the
-        # conversation layer, not the system prompt layer. Insert after any after_context
-        # block (i.e. still using rfind so it ends up immediately above the bot prefix).
         block = (pref + _format_injection(before_reply_entries) + suf).rstrip("\n")
         ctx_stripped = ctx.rstrip("\n")
         trailing     = ctx[len(ctx_stripped):]
@@ -807,15 +668,10 @@ def _replace_world_info_block(prompt, all_entries):
         else:
             ctx = block + "\n" + ctx_stripped + trailing
     if notebook_entries:
-        # Notebook entries: prepend the WI block before the prompt body so the story
-        # text stays at the end of context where the model continues it naturally.
-        # This mirrors the initial notebook injection in custom_generate_reply and
-        # ensures notebook entries survive every mid-gen interrupt re-injection.
         block = (pref + _format_injection(notebook_entries) + suf).rstrip("\n")
         ctx_stripped = ctx.rstrip("\n")
         trailing     = ctx[len(ctx_stripped):]
         if trailing:
-            # Template-formatted prompt: insert before the assistant header.
             last_nl = ctx_stripped.rfind("\n")
             if last_nl != -1:
                 ctx = ctx_stripped[:last_nl] + "\n" + block + ctx_stripped[last_nl:] + trailing
@@ -844,11 +700,9 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
         rows.append((label, toks, e.get("priority", 0)))
         labels_this_turn.add(label)
 
-    # Choose the correct session sets for this path.
     prev_labels = _prev_notebook_labels if notebook else _prev_chat_labels
     all_labels  = _all_notebook_labels  if notebook else _all_chat_labels
 
-    # Classify each entry relative to previous turns.
     entry_records = []
     for label, tokens, priority in rows:
         if label not in all_labels:
@@ -859,21 +713,18 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
             status = "returned"
         entry_records.append({"label": label, "tokens": tokens, "status": status, "priority": priority})
 
-    # Entries that triggered keywords but were cut by the token budget.
     budget_dropped_records = []
     if budget_dropped:
         injected_labels = labels_this_turn
         for e in budget_dropped:
             label = e.get("comment", "") or ", ".join(e.get("keys", []))[:30] or f"UID {e.get('uid')}"
             if label in injected_labels:
-                continue  # made it in — don't double-count
+                continue                                   
             tokens = _count_tokens(e.get("content", ""))
             budget_dropped_records.append({"label": label, "tokens": tokens, "status": "budget_dropped", "priority": e.get("priority", 0)})
 
-    # Entries present last turn that are gone this turn (keyword no longer matches).
     dropped = [lbl for lbl in prev_labels if lbl not in labels_this_turn]
 
-    # Advance session state.
     all_labels.update(labels_this_turn)
     if notebook:
         _all_notebook_labels    = all_labels
@@ -889,8 +740,8 @@ def _update_injection_preview(all_fired, interrupt_count, notebook=False, budget
     record = {
         "turn":           turn_num,
         "time":           datetime.datetime.now().strftime("%H:%M:%S"),
-        "entries":        entry_records,   # injected (priority order, highest = freshest)
-        "budget_dropped": budget_dropped_records,  # triggered but cut by token budget
+        "entries":        entry_records,                                                  
+        "budget_dropped": budget_dropped_records,                                     
         "dropped":        dropped,
         "total_tokens":   total_tokens,
         "interrupts":     interrupt_count,
@@ -967,76 +818,39 @@ def custom_generate_reply(question, original_question, state,
         else:
             yield from generate_reply_HF(q, oq, st, stopping_strings, is_chat=is_chat)
 
-    # Always inject "Between User and Assistant" entries into the prompt, even when
-    # mid-gen interrupt is disabled. chat_input_modifier stored these in state rather
-    # than the system message; we insert them here just above the bot prefix line so
-    # the model sees them at maximum recency, immediately before its response.
-    nb_for_interrupt = []   # notebook entries already injected; feeds the interrupt loop
+    nb_for_interrupt = []                                                                
     if params["activate"] and _active_lorebooks:
         pref = params["injection_prefix"]
         suf  = params["injection_suffix"]
         if pref and suf:
             if not is_chat:
-                # ── Notebook / text-completion mode ──────────────────────────────
-                # chat_input_modifier never runs here, so we scan the raw prompt
-                # directly for notebook-position entries and insert the WI block.
                 nb_matched, nb_all_matched = _find_notebook_matches(question)
-                nb_for_interrupt = nb_matched  # carry into interrupt loop below
+                nb_for_interrupt = nb_matched                                   
                 if nb_matched:
                     block = (pref + _format_injection(nb_matched) + suf).rstrip("\n")
-                    # FIX: When an instruct-template model is used in notebook mode
-                    # the prompt still ends with e.g. "<|im_start|>assistant\n".
-                    # A blind append puts the WI *inside* the assistant turn body,
-                    # making the model treat it as already-generated output and emit
-                    # EOS immediately (0 tokens out) — the same bug as the chat
-                    # before_reply path.
-                    # Guard: if the prompt ends with trailing newlines the assistant
-                    # header is there; use rstrip+rfind to land just before it.
-                    # If there are no trailing newlines it's a raw text-completion
-                    # prompt with no template — fall back to a plain append.
                     q_stripped = question.rstrip("\n")
                     trailing   = question[len(q_stripped):]
                     if trailing:
-                        # Template-formatted prompt: insert before the assistant header.
                         last_nl = q_stripped.rfind("\n")
                         if last_nl != -1:
                             question = q_stripped[:last_nl] + "\n" + block + q_stripped[last_nl:] + trailing
                         else:
                             question = block + "\n" + q_stripped + trailing
                     else:
-                        # Raw text completion: prepend WI block so the story text
-                        # remains at the end and the model continues it naturally.
-                        # Appending the block caused [/World Info] to be the last
-                        # token in context, which made the model emit EOS immediately
-                        # (0 tokens generated) — the WI fired but generation never ran.
                         question = block + "\n" + question
                     original_question = question
-                    # Update _cur_injected so the mid-gen interrupt loop's `already` set
-                    # is seeded with the notebook entries that were just injected.
-                    # Without this, _cur_injected holds stale chat-path data (or nothing),
-                    # all_injected_entries starts empty, last_trimmed ends empty, and every
-                    # notebook entry shows as DROPPED rather than REPEAT/BUDGET CUT.
                     global _cur_injected
                     _cur_injected = {_eid(e) for e in nb_matched}
-                    # Build budget_dropped = entries that matched but didn't fit.
                     injected_eids = {_eid(e) for e in nb_matched}
                     nb_budget_dropped = [e for e in nb_all_matched if _eid(e) not in injected_eids]
                     _update_injection_preview(nb_matched, 0, notebook=True, budget_dropped=nb_budget_dropped)
                 elif nb_all_matched:
-                    # Everything matched but nothing fit in budget.
                     _cur_injected = set()
                     _update_injection_preview([], 0, notebook=True, budget_dropped=nb_all_matched)
             else:
-                # ── Chat mode ────────────────────────────────────────────────────
                 before_reply_entries = state.get("_lb_before_reply_entries", [])
                 if before_reply_entries:
                     block   = (pref + _format_injection(before_reply_entries) + suf).rstrip("\n")
-                    # FIX: Strip trailing newlines before rfind so the insertion
-                    # point lands *before* the assistant turn header, not after it.
-                    # In instruct mode the prompt ends with e.g. "<|im_start|>assistant\n";
-                    # without rstrip, rfind finds that trailing \n and inserts the block
-                    # inside the assistant turn body, making the model see it as
-                    # already-generated text and emit EOS immediately (0 tokens out).
                     q_stripped = question.rstrip("\n")
                     trailing   = question[len(q_stripped):]
                     last_nl    = q_stripped.rfind("\n")
@@ -1047,8 +861,6 @@ def custom_generate_reply(question, original_question, state,
                     original_question = question
 
     if not params["activate"] or not params["mid_gen_interrupt"] or not _active_lorebooks:
-        # Write the chat preview here — chat_input_modifier no longer does it so that
-        # notebook generations (is_chat=False) can never contaminate the chat store.
         if is_chat:
             chat_matched     = state.get("_lb_chat_matched", [])
             chat_all_matched = state.get("_lb_chat_all_matched", [])
@@ -1056,15 +868,11 @@ def custom_generate_reply(question, original_question, state,
             chat_budget_dropped = [e for e in chat_all_matched if _eid(e) not in injected_eids]
             _update_injection_preview(chat_matched, 0, notebook=False, budget_dropped=chat_budget_dropped)
 
-        # ── Run normal generation, then check auto-summary threshold ──────────
         final_reply = ""
         for chunk in _base_gen(question, original_question, state):
             final_reply = chunk
             yield chunk
 
-        # Auto-summary: only in chat mode, only when enabled, only when at least
-        # one lorebook is active.  Mid-gen interrupt is intentionally NOT used for
-        # the summary pass — it runs as a clean, isolated generation.
         if (is_chat
                 and params.get("auto_summary_enabled")
                 and params.get("activate")
@@ -1082,11 +890,9 @@ def custom_generate_reply(question, original_question, state,
 
             if should_summarise:
                 _ensure_summary_lorebook(char)
-                # Show the "Summarizing…" note in the chat window while we work.
                 yield final_reply + _SUMMARY_PENDING_SUFFIX
                 history_snapshot = copy.deepcopy(state.get("history", {}))
                 _run_summary_inline(history_snapshot, char, _base_gen)
-                # Final clean yield — this is what oobabooga stores in history.
                 yield final_reply
         return
 
@@ -1095,7 +901,6 @@ def custom_generate_reply(question, original_question, state,
         already = set(_cur_injected)
         all_injected_entries = [e for e in _all_active_entries() if _eid(e) in already]
     else:
-        # notebook: _cur_injected is never set for this path; use the entries we just injected
         already = {_eid(e) for e in nb_for_interrupt}
         all_injected_entries = list(nb_for_interrupt)
     cur_question = question
@@ -1107,13 +912,6 @@ def custom_generate_reply(question, original_question, state,
     last_trimmed = list(all_injected_entries)
 
     while True:
-        # FIX FORCE-STOP: If the user pressed stop while the previous generator was
-        # being closed and the loop was about to restart, honour that signal here
-        # before spawning a new generator. Without this check, the interrupt logic
-        # closes the current gen, loops back, and immediately starts a fresh one —
-        # so a stop that coincides with an interrupt is silently swallowed.
-        # shared.stop_everything is set by oobabooga's UI stop button; we must check
-        # it at the restart boundary, not just rely on the inner generator to see it.
         try:
             if getattr(shared, "stop_everything", False):
                 break
@@ -1127,22 +925,11 @@ def custom_generate_reply(question, original_question, state,
             word_buf += new_text
             yield cumulative_text
             if interrupts < max_ints and re.search(r"\s", new_text):
-                # FIX #13: Strip the trailing incomplete word before scanning.
-                # When the AI has streamed "The world" but not yet emitted the next
-                # character, "world" sits at the end of word_buf with nothing after it,
-                # so (?!\w) sees end-of-string and passes — a false positive for any key
-                # that is a prefix of a longer word (e.g. "world" matching mid-"worldview").
-                # We only scan the *committed* portion: text up to the last word boundary.
-                # The trailing \w+ tail is kept in word_buf so it still accumulates.
                 m_tail   = re.search(r'\w+$', word_buf)
                 scan_buf = word_buf[:m_tail.start()] if m_tail else word_buf
                 pending  = word_buf[m_tail.start():] if m_tail else ""
                 new_entries = _find_new_trigger_entries(scan_buf, already, notebook=not is_chat) if scan_buf else []
                 if new_entries:
-                    # FIX #6: Only clear word_buf when an interrupt actually fires.
-                    # The original always wiped it on whitespace, so multi-word keys like
-                    # "ancient dragon" could never accumulate enough text to match.
-                    # Preserve the pending tail — it's a real partial word, not noise.
                     word_buf = pending
                     interrupts += 1
                     already |= {_eid(e) for e in new_entries}
@@ -1158,8 +945,6 @@ def custom_generate_reply(question, original_question, state,
                         pass
                     break
                 else:
-                    # Cap buffer to prevent unbounded memory growth while still allowing
-                    # multi-word phrases to accumulate across streaming chunks.
                     word_buf = word_buf[-2000:]
         if not interrupted:
             break
@@ -1168,7 +953,6 @@ def custom_generate_reply(question, original_question, state,
     budget_dropped = [e for e in all_injected_entries if _eid(e) not in injected_eids]
     _update_injection_preview(last_trimmed, interrupts, notebook=not is_chat, budget_dropped=budget_dropped)
 
-    # Auto-summary threshold check — same logic as the non-interrupt path above.
     if (is_chat
             and params.get("auto_summary_enabled")
             and params.get("activate")
@@ -1193,26 +977,6 @@ def custom_generate_reply(question, original_question, state,
     yield cumulative_text
 
 
-# ── Auto-summary engine ───────────────────────────────────────────────────────
-# Design:
-#   • Each character gets their own dedicated summary lorebook (_summary_<stem>).
-#     It is auto-created and auto-activated when that character loads, so multiple
-#     chat logs / characters never share or overwrite each other's summaries.
-#   • Token counting is per-character, keyed by character_stem.
-#   • When the threshold is crossed the summary runs *synchronously* inside
-#     custom_generate_reply, as a completely isolated _base_gen call with its own
-#     dedicated prompt and mid-gen interrupt bypassed entirely.
-#   • While the summary is generating we yield  reply + SUMMARY_PENDING_SUFFIX
-#     so the user sees a "Summarizing…" note in the chat window.
-#   • The very last yield is the clean reply (no suffix) — that is what
-#     oobabooga stores in history, so the note never pollutes the log.
-#   • DELTA updates: we record how many history turns existed at the last summary.
-#     On the next trigger we only feed the *new* turns + the previous summary text
-#     to the model, asking it to extend/update — rather than re-processing the
-#     entire history from scratch.
-#   • The summary entry is a CONSTANT entry with priority 999, injected
-#     before_context — it always wins the budget and is the first thing the model
-#     reads every turn.
 
 _SUMMARY_PENDING_SUFFIX = "\n\n*(📖 Summarizing story so far… please wait.)*"
 
@@ -1245,17 +1009,13 @@ def _ensure_summary_lorebook(char_stem: str) -> str:
     lb_stem = _summary_lb_stem(char_stem)
 
     with _state_lock:
-        # Fast path: already active for this character.
         if lb_stem in _active_lorebooks:
             _active_summary_stem = lb_stem
             return lb_stem
 
-        # Deactivate the previous character's summary lorebook (if any) so it
-        # doesn't inject stale entries into a different character's chat.
         if _active_summary_stem and _active_summary_stem in _active_lorebooks:
             del _active_lorebooks[_active_summary_stem]
 
-        # Load from disk or create fresh.
         lb = load_lorebook(lb_stem)
         if lb is None:
             lb = {
@@ -1265,7 +1025,6 @@ def _ensure_summary_lorebook(char_stem: str) -> str:
             }
             save_lorebook_file(lb_stem, lb)
 
-        # Ensure the summary entry exists inside the lorebook.
         has_entry = any(e.get("comment") == _AUTO_SUMMARY_LABEL for e in lb.get("entries", []))
         if not has_entry:
             new_uid = max((e.get("uid", 0) for e in lb.get("entries", [])), default=0) + 1
@@ -1276,17 +1035,16 @@ def _ensure_summary_lorebook(char_stem: str) -> str:
                 "keys": [],
                 "secondary_keys": [],
                 "selective_logic": "AND ANY",
-                # Placeholder shown until the first real summary is written.
                 "content": "(Story summary not yet generated — will appear after the first summary cycle.)",
                 "case_sensitive": False,
                 "match_whole_words": True,
                 "use_regex": False,
-                "priority": 999,          # always wins the token budget
-                "position": "before_context",  # injected first, before all other context
+                "priority": 999,                                        
+                "position": "before_context",                                            
                 "scan_depth": 0,
                 "probability": 100,
                 "inclusion_group": "",
-                "constant": True,         # always injected, no trigger keywords needed
+                "constant": True,                                                      
             })
             save_lorebook_file(lb_stem, lb)
 
@@ -1371,9 +1129,9 @@ def _build_delta_summary_prompt(previous_summary: str,
     that incorporates the new events without re-inventing what came before.
     """
     all_turns = history_snapshot.get("internal", [])
-    new_turns = all_turns[last_turn:]          # only events since last summary
+    new_turns = all_turns[last_turn:]                                          
     max_new = int(params.get("auto_summary_history_turns", 40))
-    new_turns = new_turns[-max_new:]           # cap to avoid overflowing context
+    new_turns = new_turns[-max_new:]                                             
 
     lines = []
     for u, a in new_turns:
@@ -1429,7 +1187,6 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
 
     _summary_status = "⏳ Generating story summary…"
 
-    # Decide: full summarise or delta update?
     with _summary_lock:
         char_st = _summary_char_state.get(char_stem, {"tokens": 0, "last_turn": 0})
         last_turn = char_st["last_turn"]
@@ -1483,7 +1240,6 @@ def _run_summary_inline(history_snapshot: dict, char_stem: str,
     summary = summary.strip()
     if summary:
         _update_summary_entry(char_stem, summary)
-        # Record the turn index so the next update knows what's already captured.
         with _summary_lock:
             _summary_char_state[char_stem] = {
                 "tokens": 0,
@@ -1556,9 +1312,6 @@ def _build_stats_html():
                 '⚠ Lorebook system is <strong>OFF</strong> — enable it in Settings.</div>')
     with _last_injection_lock:
         info = dict(_last_injection_info)
-    # FIX II: Snapshot _active_lorebooks under _state_lock before reading, consistent
-    # with the pattern used in _all_active_entries(). Unlocked reads can still see a
-    # mid-mutation dict and produce wrong counts or a RuntimeError in Python 3.12+.
     with _state_lock:
         active_lbs = list(_active_lorebooks.values())
         n_active = len(active_lbs)
@@ -1601,7 +1354,6 @@ def _build_history_html(notebook=False):
                 f'No history yet — {msg}.</p>')
 
     _S = {
-        # status: (emoji, bg, border-color, text-color)
         "new":           ("🆕", "rgba(34,197,94,.14)",  "rgba(34,197,94,.55)",  "#15803d"),
         "repeat":        ("🔁", "rgba(99,102,241,.10)", "rgba(99,102,241,.40)", "var(--body-text-color-subdued)"),
         "returned":      ("↩️", "rgba(245,158,11,.13)", "rgba(245,158,11,.50)", "#b45309"),
@@ -1610,13 +1362,12 @@ def _build_history_html(notebook=False):
 
     cards = []
     for rec in history:
-        entries         = rec["entries"]   # [{label, tokens, status}]
+        entries         = rec["entries"]                              
         budget_dropped  = rec.get("budget_dropped", [])
         dropped         = rec["dropped"]
         total           = len(entries)
         ints            = rec["interrupts"]
 
-        # ── header ──
         int_note = f" &nbsp;·&nbsp; {ints} interrupt{'s' if ints != 1 else ''}" if ints else ""
         header = (
             f'<div style="padding:5px 10px 5px 10px;'
@@ -1629,10 +1380,8 @@ def _build_history_html(notebook=False):
             f'</div>'
         )
 
-        # ── entry rows ──
         row_html = []
         for i, e in enumerate(entries):
-            # Position label: first = oldest in context, last = freshest (closest to reply)
             if total == 1:
                 pos = "#1"
             elif i == 0:
@@ -1662,7 +1411,6 @@ def _build_history_html(notebook=False):
                 f'</tr>'
             )
 
-        # ── budget-cut rows (triggered keyword but didn't fit in the token budget) ──
         for e in budget_dropped:
             prio_val = e.get("priority", 0)
             prio_badge = (f'<span style="font-size:10px;padding:1px 6px;border-radius:10px;'
@@ -1683,7 +1431,6 @@ def _build_history_html(notebook=False):
                 f'</tr>'
             )
 
-        # ── keyword-dropped rows (no longer matching) ──
         for lbl in dropped:
             row_html.append(
                 f'<tr style="opacity:.40;border-bottom:1px solid var(--border-color-primary,rgba(0,0,0,.06))">'
@@ -1740,10 +1487,8 @@ def ui():
 
     with gr.Row():
 
-        # ── LEFT: lorebook editor + entry editor ──────────────────────────────
         with gr.Column(scale=3):
 
-            # Lorebook selector bar
             with gr.Row():
                 lb_dropdown = gr.Dropdown(
                     choices=get_lorebook_files(), label="Lorebook file",
@@ -1831,7 +1576,6 @@ def ui():
               entry_save_status = gr.Markdown("")
 
 
-        # ── RIGHT: tabs ───────────────────────────────────────────────────────
         with gr.Column(scale=2):
 
             with gr.Tabs():
@@ -1980,7 +1724,6 @@ def ui():
                     st_export_file   = gr.File(label="Download", visible=False, interactive=False)
                     st_export_status = gr.Markdown("")
 
-    # ── Event handlers ────────────────────────────────────────────────────────
 
     def _do_load(name):
         global current_lorebook, _next_uid
@@ -1989,7 +1732,7 @@ def ui():
         lb = load_lorebook(name)
         if lb is None:
             return gr.update(), gr.update(), gr.update(value=f"❌ Could not load **{name}.json** — file may be corrupt."), gr.update(choices=[])
-        with _state_lock:  # FIX #10
+        with _state_lock:           
             current_lorebook = lb
             params["current_lorebook"] = name
             _next_uid = max((e.get("uid", 0) for e in lb.get("entries", [])), default=0) + 1
@@ -2001,7 +1744,7 @@ def ui():
 
     def _do_new_lb():
         global current_lorebook, _next_uid
-        with _state_lock:  # FIX #10
+        with _state_lock:           
             current_lorebook = {"name": "New Lorebook", "description": "", "entries": []}
             _next_uid = 1
         return (gr.update(value="New Lorebook"), gr.update(value=""),
@@ -2011,27 +1754,18 @@ def ui():
     def _do_save_lb(name, desc):
         global current_lorebook
         old_stem = params.get("current_lorebook", "")
-        with _state_lock:  # FIX #10
+        with _state_lock:           
             if not current_lorebook:
                 current_lorebook = {"name": name, "description": desc, "entries": []}
             else:
                 current_lorebook["name"] = name
                 current_lorebook["description"] = desc
-            # FIX 2 (new): Capture a reference to current_lorebook while still inside
-            # the lock. Without this, another Gradio event (_do_new_lb, _do_load) could
-            # swap the global to None or a different dict between the lock release and
-            # the save_lorebook_file() call, causing the wrong data (or a crash) to
-            # be written to disk.
             lb_snapshot = current_lorebook
         stem = _safe_stem(name)
         ok = save_lorebook_file(stem, lb_snapshot)
         if ok:
             params["current_lorebook"] = stem
             with _state_lock:
-                # FIX B: refresh the active copy on save.
-                # FIX 5: Also handle renames — if the stem changed, remove the old active
-                # entry and add the new one. Without this, the old stem stays active with
-                # stale data and the new stem never gets added to active generation.
                 if old_stem and old_stem != stem and old_stem in _active_lorebooks:
                     _active_lorebooks.pop(old_stem)
                     _active_lorebooks[stem] = lb_snapshot
@@ -2047,9 +1781,6 @@ def ui():
             return gr.update(), gr.update(value="❌ No lorebook selected.")
         ok = delete_lorebook_file(name)
         with _state_lock:
-            # FIX #5: The original only cleared current_lorebook. It never removed the
-            # deleted lorebook from _active_lorebooks or called _save_active_state(), so
-            # the deleted lorebook stayed active in memory and kept affecting generation.
             if params.get("current_lorebook") == name:
                 current_lorebook = None
                 params["current_lorebook"] = ""
@@ -2079,39 +1810,35 @@ def ui():
     def _do_new_entry():
         global _next_uid
         if not current_lorebook:
-            # Return enough values for the expanded output list below; all no-ops
             return (gr.update(), gr.update(value="❌ Load or create a lorebook first."),
                     *[gr.update()] * 15)
-        with _state_lock:  # FIX #10
+        with _state_lock:           
             e = {"uid": _next_uid, "enabled": True, "constant": False, "comment": f"New Entry {_next_uid}",
                  "keys": [], "secondary_keys": [], "selective_logic": "AND ANY", "content": "",
                  "case_sensitive": False, "match_whole_words": True, "use_regex": False, "priority": 10,
                  "position": "after_context", "scan_depth": 0, "probability": 100, "inclusion_group": ""}
             _next_uid += 1
             current_lorebook["entries"].append(e)
-            _sync_active_lorebook()  # FIX VI
+            _sync_active_lorebook()          
         choices = _entry_choices()
-        # FIX 9: Programmatic gr.update() on a Dropdown does not fire its .change event in
-        # recent Gradio versions, so _do_select_entry never runs and the form retains the
-        # previous entry's data. Return the new entry's field values directly here instead.
         return (
             gr.update(choices=choices, value=choices[-1] if choices else None),
             gr.update(value="New entry added! Fill in the fields and click **Save entry**."),
-            gr.update(value=e["comment"]),           # entry_comment
-            gr.update(value=""),                     # entry_keys
-            gr.update(value=""),                     # entry_sec_keys
-            gr.update(value=""),                     # entry_content
-            gr.update(value="AND ANY"),              # entry_selective_logic
-            gr.update(value=""),                     # entry_inclusion_group
-            gr.update(value=True),                   # entry_enabled
-            gr.update(value=False),                  # entry_case
-            gr.update(value=True),                   # entry_whole
-            gr.update(value=False),                  # entry_regex
-            gr.update(value=10),                     # entry_priority
-            gr.update(value="after_context"),        # entry_position
-            gr.update(value=0),                      # entry_scan_depth
-            gr.update(value=100),                    # entry_probability
-            gr.update(value=False),                  # entry_constant
+            gr.update(value=e["comment"]),                          
+            gr.update(value=""),                                 
+            gr.update(value=""),                                     
+            gr.update(value=""),                                    
+            gr.update(value="AND ANY"),                                     
+            gr.update(value=""),                                            
+            gr.update(value=True),                                  
+            gr.update(value=False),                              
+            gr.update(value=True),                                
+            gr.update(value=False),                               
+            gr.update(value=10),                                     
+            gr.update(value="after_context"),                        
+            gr.update(value=0),                                        
+            gr.update(value=100),                                       
+            gr.update(value=False),                                  
         )
 
     def _do_delete_entry(choice):
@@ -2123,29 +1850,27 @@ def ui():
         if idx < 0:
             return (gr.update(), gr.update(value="❌ Entry not found."),
                     *[gr.update()] * 15)
-        with _state_lock:  # FIX #10
+        with _state_lock:           
             current_lorebook["entries"].pop(idx)
-            _sync_active_lorebook()  # FIX VI
-        # FIX D: Clear all form fields so the deleted entry's data doesn't linger.
-        # The wiring below must include all 15 field outputs to match this return.
+            _sync_active_lorebook()          
         return (
             gr.update(choices=_entry_choices(), value=None),
             gr.update(value="Entry removed."),
-            gr.update(value=""),           # entry_comment
-            gr.update(value=""),           # entry_keys
-            gr.update(value=""),           # entry_sec_keys
-            gr.update(value=""),           # entry_content
-            gr.update(value="AND ANY"),    # entry_selective_logic
-            gr.update(value=""),           # entry_inclusion_group
-            gr.update(value=True),         # entry_enabled
-            gr.update(value=False),        # entry_case
-            gr.update(value=True),         # entry_whole
-            gr.update(value=False),        # entry_regex
-            gr.update(value=10),           # entry_priority
-            gr.update(value="after_context"), # entry_position
-            gr.update(value=0),            # entry_scan_depth
-            gr.update(value=100),          # entry_probability
-            gr.update(value=False),        # entry_constant
+            gr.update(value=""),                          
+            gr.update(value=""),                       
+            gr.update(value=""),                           
+            gr.update(value=""),                          
+            gr.update(value="AND ANY"),                           
+            gr.update(value=""),                                  
+            gr.update(value=True),                        
+            gr.update(value=False),                    
+            gr.update(value=True),                      
+            gr.update(value=False),                     
+            gr.update(value=10),                           
+            gr.update(value="after_context"),                 
+            gr.update(value=0),                              
+            gr.update(value=100),                             
+            gr.update(value=False),                        
         )
 
     def _do_save_entry(choice, comment, keys_str, sec_keys_str, content, selective_logic,
@@ -2158,11 +1883,7 @@ def ui():
         sec_keys = [k.strip() for k in sec_keys_str.split(",") if k.strip()]
         uid = _uid_from_choice(choice) if choice else None
         idx = _idx_from_uid(uid) if uid is not None else -1
-        with _state_lock:  # FIX #10
-            # FIX VII: Assign uid inside the lock. The original read _next_uid at line
-            # `"uid": uid if idx >= 0 else _next_uid` before acquiring the lock, so two
-            # concurrent Gradio events could both read the same _next_uid and create
-            # entries with duplicate UIDs. Building entry_data inside the lock closes this.
+        with _state_lock:           
             entry_data = {
                 "uid": uid if idx >= 0 else _next_uid,
                 "enabled": bool(enabled), "constant": bool(constant),
@@ -2180,8 +1901,6 @@ def ui():
                 _next_uid += 1
                 current_lorebook["entries"].append(entry_data)
                 status = "✅ New entry saved! *(Remember to also **Save** the lorebook to write to disk.)*"
-            # FIX VI: Push entry changes into the active copy so generation sees them
-            # immediately without requiring a full lorebook save/reload cycle.
             _sync_active_lorebook()
         choices = _entry_choices()
         new_choice = next((c for c in choices if f"[{entry_data['uid']}]" in c), None)
@@ -2203,10 +1922,6 @@ def ui():
 
     def _do_toggle_active(selected):
         selected_set = set(selected or [])
-        # FIX A: Wrap all _active_lorebooks mutations in _state_lock.
-        # Merged into a single lock block: read, mutate, snapshot, and save
-        # now happen atomically so there is no window between releases where
-        # another thread can see a half-mutated dict.
         with _state_lock:
             current_set = set(_active_lorebooks.keys())
             for stem in current_set - selected_set:
@@ -2247,12 +1962,8 @@ def ui():
     def _do_st_import(file_obj):
         global current_lorebook, _next_uid
         if file_obj is None:
-            # FIX 1 (new): Gradio wiring expects 6 outputs from _do_st_import.
-            # All error-path early returns must match or Gradio throws ValueError.
             return gr.update(value="❌ No file selected."), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
         try:
-            # FIX C: Gradio's gr.File returns a file-like object in some versions and a
-            # plain string path in others. getattr fallback handles both cases safely.
             file_path = getattr(file_obj, "name", file_obj)
             raw = Path(file_path).read_bytes()
         except Exception as exc:
@@ -2265,17 +1976,10 @@ def ui():
         while (LOREBOOKS_DIR / f"{stem}.json").exists():
             stem = f"{base_stem}_{counter}"
             counter += 1
-        # FIX 4: Strip internal keys from the saved file. Previously save_lorebook_file()
-        # was called with the raw `lb` dict which still contained "_source" and "_import_stats".
-        # FIX F (previous round) only cleaned current_lorebook in memory but the file on disk
-        # was already written with the dirty dict. Now we clean first, then save and assign.
         clean_lb = {k: v for k, v in lb.items() if not k.startswith("_")}
-        # Pull stats from the original lb before it's cleaned, for the UI message below.
         stats = lb.get("_import_stats", {})
         if not save_lorebook_file(stem, clean_lb):
             return gr.update(value="❌ Imported but could not save — check folder permissions."), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-        # FIX III: Wrap mutations to current_lorebook and _next_uid in _state_lock,
-        # consistent with every other handler that touches these globals.
         with _state_lock:
             current_lorebook = clean_lb
             params["current_lorebook"] = stem
@@ -2297,8 +2001,6 @@ def ui():
         return (gr.update(value=msg),
                 gr.update(choices=files, value=stem),
                 gr.update(choices=files, value=active_keys),
-                # FIX E: Populate the editor fields from the imported lorebook so the
-                # user sees the imported data immediately without manually reselecting.
                 gr.update(value=clean_lb.get("name", stem)),
                 gr.update(value=clean_lb.get("description", "")),
                 gr.update(choices=_entry_choices(), value=None))
@@ -2386,11 +2088,7 @@ def ui():
         _save_params()
         return gr.update(interactive=enabled)
 
-    # ── Wire events ───────────────────────────────────────────────────────────
 
-    # FIX 7: Safe conversion helpers so settings callbacks don't crash when Gradio
-    # sends None (e.g. when a numeric field is cleared). Falls back to current value.
-    # Each helper also persists params to disk so settings survive restarts.
     def _safe_int(key, x):
         try:
             params[key] = int(x)
@@ -2409,7 +2107,6 @@ def ui():
         params[key] = x
         _save_params()
 
-    # Lorebook file management
     lb_dropdown.change(_do_load,   [lb_dropdown], [lb_name_input, lb_desc_input, lb_status, entry_radio])
     lb_new_btn.click(  _do_new_lb, [],            [lb_name_input, lb_desc_input, lb_status, entry_radio])
 
@@ -2419,20 +2116,15 @@ def ui():
     )
     lb_delete_btn.click(
         _do_delete_lb_and_refresh, [lb_dropdown],
-        # FIX D: Added lb_name_input, lb_desc_input, entry_radio so they're cleared on delete.
         [lb_dropdown, lb_status, active_pills, stats_html, lb_name_input, lb_desc_input, entry_radio],
     )
 
-    # Active pills toggle
-    # FIX VIII: Added active_pills as a third output so the UI deselects pills whose
-    # lorebook files failed to load (corrupt/missing), keeping display in sync with reality.
     active_pills.change(_do_toggle_active, [active_pills], [stats_html, active_status, active_pills])
     active_refresh_btn.click(
         lambda: gr.update(choices=get_lorebook_files(), value=_get_active_keys()),
         [], [active_pills]
     )
 
-    # Entry management
     entry_radio.change(
         _do_select_entry, [entry_radio],
         [entry_comment, entry_keys, entry_sec_keys, entry_content,
@@ -2443,8 +2135,6 @@ def ui():
     )
     entry_new_btn.click(
         _do_new_entry, [],
-        # FIX 9: Also update all form fields directly so the editor shows the new
-        # entry's blank defaults instead of the previously selected entry's data.
         [entry_radio, entry_save_status,
          entry_comment, entry_keys, entry_sec_keys, entry_content,
          entry_selective_logic, entry_inclusion_group,
@@ -2454,7 +2144,6 @@ def ui():
     )
     entry_delete_btn.click(
         _do_delete_entry, [entry_radio],
-        # FIX D: Added all form fields so they're cleared when an entry is deleted.
         [entry_radio, entry_save_status,
          entry_comment, entry_keys, entry_sec_keys, entry_content,
          entry_selective_logic, entry_inclusion_group,
@@ -2472,9 +2161,6 @@ def ui():
         [entry_save_status, entry_radio],
     )
 
-    # Settings
-    # FIX E: Wrap all bare component references in lists.
-    # FIX 7: Use _safe_int/_safe_float so cleared/None fields don't crash the handler.
     activate_cb.change(         _set_activate,                                                          [activate_cb],          [stats_html])
     scan_depth_n.change(        lambda x: _safe_int("scan_depth",          x),                         [scan_depth_n],         None)
     token_budget_n.change(      lambda x: _safe_int("token_budget",        x),                         [token_budget_n],       None)
@@ -2489,7 +2175,6 @@ def ui():
     position_override_cb.change(_set_position_override, [position_override_cb], [position_override_dd])
     position_override_dd.change(lambda x: _set_param("position_override_value", x),                    [position_override_dd], None)
 
-    # Auto-summary settings
     auto_summary_cb.change(          lambda x: _set_param("auto_summary_enabled",       x), [auto_summary_cb],          None)
     auto_summary_interval_n.change(  lambda x: _safe_int("auto_summary_interval",       x), [auto_summary_interval_n],  None)
     auto_summary_max_tokens_n.change(lambda x: _safe_int("auto_summary_max_new_tokens", x), [auto_summary_max_tokens_n],None)
@@ -2499,12 +2184,9 @@ def ui():
         """Manually trigger a full re-summarise from the UI (ignores token counter,
         resets last_turn to 0 so the entire history is processed fresh)."""
         global _summary_status
-        # We don't have access to live state here so we use _active_summary_stem
-        # to find the current character's summary lorebook.
         if not _active_summary_stem:
             return gr.update(value="⚠ No active character summary lorebook found. Start a chat first.")
 
-        # Derive char_stem from the lorebook stem by stripping the prefix.
         char = _active_summary_stem[len(_SUMMARY_LB_PREFIX):]
 
         try:
@@ -2518,7 +2200,6 @@ def ui():
         except Exception as exc:
             return gr.update(value=f"❌ Could not load generation modules: {exc}")
 
-        # Reset last_turn so _run_summary_inline does a full re-summarise.
         with _summary_lock:
             _summary_char_state[char] = {"tokens": 0, "last_turn": 0}
 
@@ -2531,15 +2212,11 @@ def ui():
     auto_summary_trigger_btn.click(_do_force_summary,      [], [auto_summary_status_md])
     auto_summary_status_md.change( _refresh_summary_status, [], [auto_summary_status_md])
 
-    # Import / Export
-    # FIX E: Added lb_name_input, lb_desc_input, entry_radio so the editor populates
-    # immediately after a SillyTavern import without requiring a manual reselect.
     st_import_btn.click(_do_st_import, [st_import_file],
                         [st_import_status, lb_dropdown, active_pills,
                          lb_name_input, lb_desc_input, entry_radio])
     st_export_btn.click(_do_st_export, [],               [st_export_status, st_export_file])
 
-    # Overview + stats + preview refresh
     overview_btn.click(   _do_overview,                                   [],  [overview_box])
     stats_refresh_btn.click(lambda: gr.update(value=_build_stats_html()), [],  [stats_html])
     preview_refresh_btn.click(        _do_preview_refresh,          [], [preview_box,          history_box])
