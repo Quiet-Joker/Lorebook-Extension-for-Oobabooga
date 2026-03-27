@@ -1,0 +1,120 @@
+{
+  "name": "Tool calling",
+  "description": "list of available tools for LLM",
+  "entries": [
+    {
+      "uid": 1,
+      "enabled": true,
+      "constant": false,
+      "comment": "fetch_webpage",
+      "keys": [
+        "fetch_webpage",
+        "fetch_webpage()",
+        "research",
+        "find online"
+      ],
+      "secondary_keys": [],
+      "selective_logic": "AND ANY",
+      "content": "from modules.web_search import download_web_page, truncate_content_by_tokens\n\ntool = {\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"fetch_webpage\",\n        \"description\": \"Fetch and read the contents of a web page given its URL. Returns the page content as plain text.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"url\": {\"type\": \"string\", \"description\": \"The URL of the web page to fetch.\"},\n                \"max_tokens\": {\"type\": \"integer\", \"description\": \"Maximum number of tokens in the returned content (default: 2048).\"},\n            },\n            \"required\": [\"url\"]\n        }\n    }\n}\n\n\ndef execute(arguments):\n    url = arguments.get(\"url\", \"\")\n    max_tokens = arguments.get(\"max_tokens\", 2048)\n    if not url:\n        return {\"error\": \"No URL provided.\"}\n\n    content = download_web_page(url, include_links=True)\n    if not content or not content.strip():\n        return {\"error\": f\"Failed to fetch content from {url}\"}\n\n    return {\"url\": url, \"content\": truncate_content_by_tokens(content, max_tokens=max_tokens)}",
+      "case_sensitive": false,
+      "match_whole_words": true,
+      "use_regex": false,
+      "priority": 10,
+      "position": "after_context",
+      "scan_depth": 0,
+      "probability": 100,
+      "inclusion_group": ""
+    },
+    {
+      "uid": 2,
+      "enabled": true,
+      "constant": false,
+      "comment": "web_search",
+      "keys": [
+        "web_search",
+        "web_search()",
+        "search online",
+        "google"
+      ],
+      "secondary_keys": [],
+      "selective_logic": "AND ANY",
+      "content": "from modules.web_search import perform_web_search\n\ntool = {\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"web_search\",\n        \"description\": \"Search the web using DuckDuckGo and return a list of result titles and URLs. Use fetch_webpage to read the contents of a specific result.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"query\": {\"type\": \"string\", \"description\": \"The search query.\"},\n            },\n            \"required\": [\"query\"]\n        }\n    }\n}\n\n\ndef execute(arguments):\n    query = arguments.get(\"query\", \"\")\n    results = perform_web_search(query, num_pages=None, fetch_content=False)\n    output = []\n    for r in results:\n        if r:\n            output.append({\"title\": r[\"title\"], \"url\": r[\"url\"]})\n\n    return output if output else [{\"error\": \"No results found.\"}]",
+      "case_sensitive": false,
+      "match_whole_words": true,
+      "use_regex": false,
+      "priority": 10,
+      "position": "after_context",
+      "scan_depth": 0,
+      "probability": 100,
+      "inclusion_group": ""
+    },
+    {
+      "uid": 3,
+      "enabled": true,
+      "constant": false,
+      "comment": "datetime",
+      "keys": [
+        "datetime",
+        "datetime()",
+        "today",
+        "tomorrow",
+        "yesterday"
+      ],
+      "secondary_keys": [],
+      "selective_logic": "AND ANY",
+      "content": "from datetime import datetime\n\ntool = {\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"get_datetime\",\n        \"description\": \"Get the current date and time.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {},\n        }\n    }\n}\n\n\ndef execute(arguments):\n    now = datetime.now()\n    return {\"date\": now.strftime(\"%Y-%m-%d\"), \"time\": now.strftime(\"%I:%M %p\")}",
+      "case_sensitive": false,
+      "match_whole_words": true,
+      "use_regex": false,
+      "priority": 10,
+      "position": "after_context",
+      "scan_depth": 0,
+      "probability": 100,
+      "inclusion_group": ""
+    },
+    {
+      "uid": 4,
+      "enabled": true,
+      "constant": false,
+      "comment": "calculate",
+      "keys": [
+        "calculate",
+        "calculate()"
+      ],
+      "secondary_keys": [],
+      "selective_logic": "AND ANY",
+      "content": "import ast\nimport operator\n\nOPERATORS = {\n    ast.Add: operator.add,\n    ast.Sub: operator.sub,\n    ast.Mult: operator.mul,\n    ast.Div: operator.truediv,\n    ast.Pow: operator.pow,\n    ast.Mod: operator.mod,\n    ast.USub: operator.neg,\n}\n\n\ndef _eval(node):\n    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):\n        return node.value\n    elif isinstance(node, ast.BinOp) and type(node.op) in OPERATORS:\n        left = _eval(node.left)\n        right = _eval(node.right)\n        if isinstance(node.op, ast.Pow) and isinstance(right, (int, float)) and abs(right) > 10000:\n            raise ValueError(\"Exponent too large (max 10000)\")\n        return OPERATORS[type(node.op)](left, right)\n    elif isinstance(node, ast.UnaryOp) and type(node.op) in OPERATORS:\n        return OPERATORS[type(node.op)](_eval(node.operand))\n    raise ValueError(f\"Unsupported expression\")\n\n\ntool = {\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"calculate\",\n        \"description\": \"Evaluate a math expression. Supports +, -, *, /, **, %.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"expression\": {\"type\": \"string\", \"description\": \"The math expression to evaluate (e.g. '2 * (3 + 4)').\"},\n            },\n            \"required\": [\"expression\"]\n        }\n    }\n}\n\n\ndef execute(arguments):\n    expr = arguments.get(\"expression\", \"\")\n    try:\n        tree = ast.parse(expr, mode='eval')\n        result = _eval(tree.body)\n        return {\"expression\": expr, \"result\": result}\n    except Exception as e:\n        return {\"error\": str(e)}",
+      "case_sensitive": false,
+      "match_whole_words": true,
+      "use_regex": false,
+      "priority": 10,
+      "position": "after_context",
+      "scan_depth": 0,
+      "probability": 100,
+      "inclusion_group": ""
+    },
+    {
+      "uid": 5,
+      "enabled": true,
+      "constant": false,
+      "comment": "roll_dice",
+      "keys": [
+        "roll_dice",
+        "roll a dice",
+        "randomly generate",
+        "roll_dice()"
+      ],
+      "secondary_keys": [],
+      "selective_logic": "AND ANY",
+      "content": "import random\n\ntool = {\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"roll_dice\",\n        \"description\": \"Roll one or more dice with the specified number of sides.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"count\": {\"type\": \"integer\", \"description\": \"Number of dice to roll.\", \"default\": 1},\n                \"sides\": {\"type\": \"integer\", \"description\": \"Number of sides per die.\", \"default\": 20},\n            },\n        }\n    }\n}\n\n\ndef execute(arguments):\n    count = max(1, min(arguments.get(\"count\", 1), 1000))\n    sides = max(2, min(arguments.get(\"sides\", 20), 1000))\n    rolls = [random.randint(1, sides) for _ in range(count)]\n    return {\"rolls\": rolls, \"total\": sum(rolls)}",
+      "case_sensitive": false,
+      "match_whole_words": true,
+      "use_regex": false,
+      "priority": 10,
+      "position": "after_context",
+      "scan_depth": 0,
+      "probability": 100,
+      "inclusion_group": ""
+    }
+  ]
+}
