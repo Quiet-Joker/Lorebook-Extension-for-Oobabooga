@@ -561,6 +561,62 @@ def set_param(key, x):
     _save_params()
 
 
+def do_select_summary_template(choice):
+    if not choice:
+        return gr.update(), gr.update(), gr.update()
+    try:
+        from .summary import load_template
+        result = load_template(choice)
+        if result is None:
+            return gr.update(), gr.update(), gr.update()
+        full, delta = result
+        params["auto_summary_full_prompt"]  = full
+        params["auto_summary_delta_prompt"] = delta
+        _save_params()
+        return gr.update(value=full), gr.update(value=delta), gr.update(value=choice)
+    except Exception:
+        return gr.update(), gr.update(), gr.update()
+
+
+def do_refresh_template_list():
+    try:
+        from .summary import get_template_names
+        return gr.update(choices=get_template_names(), value=None)
+    except Exception:
+        return gr.update()
+
+
+def do_save_template(name, full, delta):
+    name = (name or "").strip()
+    if not name:
+        return gr.update(value="❌ Enter a template name first."), gr.update()
+    try:
+        from .summary import TEMPLATES_DIR, _TEMPLATE_SEPARATOR, get_template_names
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        path = TEMPLATES_DIR / f"{name}.txt"
+        path.write_text((full or "") + _TEMPLATE_SEPARATOR + (delta or ""), encoding="utf-8")
+        return (gr.update(value=f"✅ Saved **{name}**."),
+                gr.update(choices=get_template_names(), value=name))
+    except Exception as exc:
+        return gr.update(value=f"❌ Save failed: {exc}"), gr.update()
+
+
+def do_delete_template(name):
+    name = (name or "").strip()
+    if not name:
+        return gr.update(value="❌ Select a template from the dropdown first."), gr.update()
+    try:
+        from .summary import TEMPLATES_DIR, get_template_names
+        path = TEMPLATES_DIR / f"{name}.txt"
+        if not path.exists():
+            return gr.update(value=f"❌ **{name}** not found."), gr.update()
+        path.unlink()
+        return (gr.update(value=f"🗑 Deleted **{name}**."),
+                gr.update(choices=get_template_names(), value=None))
+    except Exception as exc:
+        return gr.update(value=f"❌ Delete failed: {exc}"), gr.update()
+
+
 def do_force_summary():
     try:
         from . import summary as _summary_mod
