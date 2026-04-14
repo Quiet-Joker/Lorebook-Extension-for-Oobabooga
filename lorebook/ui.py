@@ -14,7 +14,8 @@ from .ui_handlers import (
     do_clear_history, do_clear_history_notebook,
     do_st_import_preview, do_st_import_confirm, do_st_import_cancel, do_st_export,
     set_activate, set_position_override, safe_int, set_param,
-    do_force_summary,
+    do_select_summary_template, do_refresh_template_list,
+    do_save_template, do_delete_template, do_force_summary,
 )
 
 _ENTRY_FIELDS = [
@@ -144,6 +145,23 @@ def ui():
     w["auto_summary_include_char_card_cb"].change(
         lambda x: set_param("auto_summary_include_char_card", x),
         [w["auto_summary_include_char_card_cb"]], None)
+    w["auto_summary_template_dd"].change(
+        do_select_summary_template,
+        [w["auto_summary_template_dd"]],
+        [w["auto_summary_full_prompt_tb"], w["auto_summary_delta_prompt_tb"],
+         w["auto_summary_template_name_tb"]])
+    w["auto_summary_template_refresh_btn"].click(
+        do_refresh_template_list, [],
+        [w["auto_summary_template_dd"]])
+    w["auto_summary_template_save_btn"].click(
+        do_save_template,
+        [w["auto_summary_template_name_tb"], w["auto_summary_full_prompt_tb"],
+         w["auto_summary_delta_prompt_tb"]],
+        [w["auto_summary_template_status"], w["auto_summary_template_dd"]])
+    w["auto_summary_template_delete_btn"].click(
+        do_delete_template,
+        [w["auto_summary_template_name_tb"]],
+        [w["auto_summary_template_status"], w["auto_summary_template_dd"]])
     w["auto_summary_full_prompt_tb"].change(
         lambda x: set_param("auto_summary_full_prompt", x),
         [w["auto_summary_full_prompt_tb"]], None)
