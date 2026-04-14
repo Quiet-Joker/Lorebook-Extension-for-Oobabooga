@@ -6,6 +6,14 @@ from .injection import _get_active_keys
 from .ui_helpers import _build_stats_html, _build_history_html, _budget_bar_html
 
 
+def _get_template_names_safe() -> list:
+    try:
+        from .summary import get_template_names
+        return get_template_names()
+    except Exception:
+        return []
+
+
 def build_layout() -> dict:
     with gr.Row():
 
@@ -328,6 +336,30 @@ def _build_auto_summary_tab() -> dict:
 
     with gr.Accordion("📑 Prompt templates", open=False, elem_classes="tgw-accordion"):
         gr.Markdown(
+            "Choose a preset to instantly load a full + delta prompt pair, "
+            "or edit the boxes below manually."
+        )
+        with gr.Row():
+            auto_summary_template_dd = gr.Dropdown(
+                choices=_get_template_names_safe(),
+                value=None,
+                label="Template preset",
+                elem_classes="slim-dropdown",
+                info="Files live in the 'Auto Summary Prompt Templates' folder — add, edit or delete .txt files there freely.",
+                allow_custom_value=False,
+                scale=4,
+            )
+            auto_summary_template_refresh_btn = gr.Button("🔄", elem_classes="refresh-button", scale=0)
+        with gr.Row():
+            auto_summary_template_name_tb = gr.Textbox(
+                label="Template name", placeholder="My Custom Template",
+                info="Name for Save. Overwrites existing file if the name matches.",
+                scale=4,
+            )
+            auto_summary_template_save_btn   = gr.Button("Save",   variant="primary", elem_classes="lb-btn-primary refresh-button", scale=1)
+            auto_summary_template_delete_btn = gr.Button("Delete", variant="stop",    elem_classes="lb-btn-danger  refresh-button", scale=1)
+        auto_summary_template_status = gr.Markdown("")
+        gr.Markdown(
             "**Full summary prompt** — used for the very first summary and after *Force summary now*. "
             "Use `{conversation}` where the transcript should be inserted."
         )
@@ -359,6 +391,12 @@ def _build_auto_summary_tab() -> dict:
         auto_summary_max_new_tokens_n=auto_summary_max_new_tokens_n,
         auto_summary_history_turns_n=auto_summary_history_turns_n,
         auto_summary_include_char_card_cb=auto_summary_include_char_card_cb,
+        auto_summary_template_dd=auto_summary_template_dd,
+        auto_summary_template_refresh_btn=auto_summary_template_refresh_btn,
+        auto_summary_template_name_tb=auto_summary_template_name_tb,
+        auto_summary_template_save_btn=auto_summary_template_save_btn,
+        auto_summary_template_delete_btn=auto_summary_template_delete_btn,
+        auto_summary_template_status=auto_summary_template_status,
         auto_summary_full_prompt_tb=auto_summary_full_prompt_tb,
         auto_summary_delta_prompt_tb=auto_summary_delta_prompt_tb,
         auto_summary_force_btn=auto_summary_force_btn,
