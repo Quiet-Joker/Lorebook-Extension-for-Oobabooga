@@ -496,12 +496,16 @@ def _update_summary_entry(char_stem: str, conv_id: str, new_content: str) -> Non
 
 
 def _build_full_summary_prompt(history_snapshot: dict) -> str:
-    n     = int(params.get("auto_summary_history_turns", 40))
-    turns = history_snapshot.get("internal", [])[-n:]
+    n        = int(params.get("auto_summary_history_turns", 40))
+    internal = history_snapshot.get("internal", [])[-n:]
+    visible  = history_snapshot.get("visible",  [])[-n:]
     lines: list[str] = []
-    for u, a in turns:
+    for i, (u, a) in enumerate(internal):
         u = (u or "").strip()
         a = (a or "").strip()
+        if not u or u == "<|BEGIN-VISIBLE-CHAT|>":
+            if i < len(visible):
+                u = (visible[i][0] or "").strip()
         if u and u != "<|BEGIN-VISIBLE-CHAT|>":
             lines.append(f"[User]: {u}")
         if a:
@@ -513,15 +517,21 @@ def _build_full_summary_prompt(history_snapshot: dict) -> str:
 def _build_delta_summary_prompt(previous_summary: str,
                                 history_snapshot: dict,
                                 last_turn: int) -> str:
-    all_turns = history_snapshot.get("internal", [])
-    new_turns = all_turns[last_turn:]
+    all_internal = history_snapshot.get("internal", [])
+    all_visible  = history_snapshot.get("visible",  [])
+    new_internal = all_internal[last_turn:]
+    new_visible  = all_visible[last_turn:]
     max_new   = int(params.get("auto_summary_history_turns", 40))
-    new_turns = new_turns[-max_new:]
+    new_internal = new_internal[-max_new:]
+    new_visible  = new_visible[-max_new:]
 
     lines: list[str] = []
-    for u, a in new_turns:
+    for i, (u, a) in enumerate(new_internal):
         u = (u or "").strip()
         a = (a or "").strip()
+        if not u or u == "<|BEGIN-VISIBLE-CHAT|>":
+            if i < len(new_visible):
+                u = (new_visible[i][0] or "").strip()
         if u and u != "<|BEGIN-VISIBLE-CHAT|>":
             lines.append(f"[User]: {u}")
         if a:
