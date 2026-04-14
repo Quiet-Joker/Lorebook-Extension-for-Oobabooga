@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 
-from .config import params, _count_tokens, LOREBOOKS_DIR
+from .config import params, _count_tokens, LOREBOOKS_DIR, TEMPLATES_DIR
 from .state import _st, _bump_active_version
 from .storage import (
     _safe_stem,
@@ -82,13 +82,140 @@ _DEFAULT_DELTA_PROMPT = (
     "Updated story summary:"
 )
 
+_STRUCTURED_SHORTHAND_FULL_PROMPT = (
+    "You are a story tracker. Summarize the roleplay transcript below using ONLY "
+    "these labeled tags — one line each, terse and specific. No prose, no preamble.\n\n"
+    "[SETTING] Current location and situation in one line.\n"
+    "[EVENTS] Chronological chain of key events, each prefixed with →\n"
+    "[CHARACTERS] Each significant character — name, role, current status/emotional state.\n"
+    "[TENSION] The central conflict or power dynamic right now.\n"
+    "[OPEN] Unresolved threads, pending choices, unanswered questions.\n\n"
+    "Rules:\n"
+    "- Every item must be specific: use character names, places, exact actions.\n"
+    "- No filler words. No sentences that could be cut without losing information.\n"
+    "- Do NOT start with 'Sure', 'Here is', or any preamble. "
+    "Output the tags immediately.\n\n"
+    "--- STORY TRANSCRIPT ---\n"
+    "{conversation}\n"
+    "--- END TRANSCRIPT ---\n\n"
+    "[SETTING]"
+)
+
+_STRUCTURED_SHORTHAND_DELTA_PROMPT = (
+    "You are a story tracker maintaining a running shorthand log.\n\n"
+    "Update the existing summary below by incorporating the new events. "
+    "Keep all five tags. Replace or extend each tag's content as needed — "
+    "preserve important history, add new developments.\n\n"
+    "Rules:\n"
+    "- Keep each tag to one line (EVENTS may be a chain of → items).\n"
+    "- Specific names and actions only. No filler.\n"
+    "- Do NOT start with 'Sure' or any preamble. "
+    "Output the updated tags immediately.\n\n"
+    "--- EXISTING SUMMARY ---\n"
+    "{previous_summary}\n"
+    "--- END EXISTING SUMMARY ---\n\n"
+    "--- NEW EVENTS ---\n"
+    "{new_events}\n"
+    "--- END NEW EVENTS ---\n\n"
+    "[SETTING]"
+)
+
+_MARKDOWN_BULLETS_FULL_PROMPT = (
+    "You are a story chronicler. Summarize the roleplay transcript below using "
+    "the exact markdown structure shown. Be specific — use character names, "
+    "places, and exact events. No prose paragraphs. No preamble.\n\n"
+    "**Setting:** One-line description of current location and situation.\n\n"
+    "**Events:**\n"
+    "- [chronological event]\n"
+    "- [chronological event]\n\n"
+    "**Characters:**\n"
+    "- [Name] — role, current state or relationship to protagonist\n\n"
+    "**Tension:** One line on the central conflict or power dynamic.\n\n"
+    "**Unresolved:**\n"
+    "- [open thread or pending choice]\n\n"
+    "Rules:\n"
+    "- Every bullet must be specific and earned — cut anything vague.\n"
+    "- Do NOT start with 'Sure', 'Here is', or any preamble.\n\n"
+    "--- STORY TRANSCRIPT ---\n"
+    "{conversation}\n"
+    "--- END TRANSCRIPT ---\n\n"
+    "**Setting:**"
+)
+
+_MARKDOWN_BULLETS_DELTA_PROMPT = (
+    "You are a story chronicler maintaining a running summary.\n\n"
+    "Rewrite the summary below to incorporate the new events. "
+    "Keep the exact same markdown structure. "
+    "Update each section as needed — preserve important history, "
+    "add new developments in chronological order.\n\n"
+    "Rules:\n"
+    "- Specific names, places, and actions only.\n"
+    "- Do NOT start with 'Sure' or any preamble. "
+    "Output the updated summary immediately.\n\n"
+    "--- EXISTING SUMMARY ---\n"
+    "{previous_summary}\n"
+    "--- END EXISTING SUMMARY ---\n\n"
+    "--- NEW EVENTS ---\n"
+    "{new_events}\n"
+    "--- END NEW EVENTS ---\n\n"
+    "**Setting:**"
+)
+
+# ---------------------------------------------------------------------------
+# Template file helpers
+# ---------------------------------------------------------------------------
+_TEMPLATE_SEPARATOR = "\n===DELTA PROMPT===\n"
+
+_DEFAULT_TEMPLATE_FILES: dict = {
+    "Dense Prose": (_DEFAULT_FULL_PROMPT, _DEFAULT_DELTA_PROMPT),
+    "Structured Shorthand [TAGS]": (_STRUCTURED_SHORTHAND_FULL_PROMPT, _STRUCTURED_SHORTHAND_DELTA_PROMPT),
+    "Markdown Bullets": (_MARKDOWN_BULLETS_FULL_PROMPT, _MARKDOWN_BULLETS_DELTA_PROMPT),
+}
+
+
+def _write_default_templates() -> None:
+    """Seed the templates folder with the built-in presets (skips files that already exist)."""
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    for name, (full, delta) in _DEFAULT_TEMPLATE_FILES.items():
+        path = TEMPLATES_DIR / f"{name}.txt"
+        if not path.exists():
+            try:
+                path.write_text(full + _TEMPLATE_SEPARATOR + delta, encoding="utf-8")
+            except Exception:
+                logger.exception("Auto-summary: could not write default template %r", name)
+
+
+def get_template_names() -> list:
+    """Return a sorted list of template names (file stems) from the templates folder."""
+    if not TEMPLATES_DIR.exists():
+        return []
+    return sorted(p.stem for p in TEMPLATES_DIR.glob("*.txt"))
+
+
+def load_template(name: str):
+    """Load a template by name. Returns (full_prompt, delta_prompt) or None."""
+    path = TEMPLATES_DIR / f"{name}.txt"
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        logger.exception("Auto-summary: could not read template %r", name)
+        return None
+    parts = text.split(_TEMPLATE_SEPARATOR, 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    # Fallback: treat the whole file as the full prompt, empty delta
+    return text.strip(), ""
+
+
 _AUTO_SUMMARY_PARAM_DEFAULTS: dict = {
     "auto_summary_enabled":           False,
     "auto_summary_interval":          2000,
     "auto_summary_max_new_tokens":    512,
     "auto_summary_history_turns":     40,
-    "auto_summary_full_prompt":       _DEFAULT_FULL_PROMPT,
-    "auto_summary_delta_prompt":      _DEFAULT_DELTA_PROMPT,
+    "auto_summary_full_prompt":       _MARKDOWN_BULLETS_FULL_PROMPT,
+    "auto_summary_delta_prompt":      _MARKDOWN_BULLETS_DELTA_PROMPT,
     "auto_summary_include_char_card": False,
 }
 
@@ -111,6 +238,8 @@ def _register_params() -> None:
                     params[k] = data[k]
         except Exception:
             logger.exception("Failed to reload auto-summary params from disk")
+
+    _write_default_templates()
 
 
 _register_params()
