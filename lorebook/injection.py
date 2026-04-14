@@ -363,7 +363,8 @@ def custom_generate_reply(question, original_question, state,
                 else:
                     raise
 
-    if is_chat and params.get("auto_summary_enabled") and params.get("activate"):
+    _gen_mode = state.get("mode", "chat")
+    if params.get("auto_summary_enabled") and params.get("activate") and (is_chat or _gen_mode == "instruct"):
         try:
             from .summary import should_summarise, run_auto_summary
             if should_summarise(state):
