@@ -5,7 +5,7 @@ from .injection import _get_active_keys
 from .ui_helpers import _build_stats_html, custom_css          # noqa: F401
 from .ui_layout import build_layout
 from .ui_handlers import (
-    do_load, do_new_lb, do_save_lb_and_refresh, do_delete_lb_and_refresh,
+    do_load, do_reload_lb, do_new_lb, do_save_lb_and_refresh, do_delete_lb_and_refresh,
     do_toggle_active,
     do_select_entry, do_new_entry, do_clone_entry, do_delete_entry, do_save_entry,
     do_filter_entries, do_test_match,
@@ -40,6 +40,9 @@ def ui():
         [w["lb_name_input"], w["lb_desc_input"], w["lb_status"], w["entry_radio"]])
     w["lb_refresh_btn"].click(
         lambda: gr.update(choices=get_lorebook_files()), [], [w["lb_dropdown"]])
+    w["lb_reload_btn"].click(
+        do_reload_lb, [],
+        [w["lb_name_input"], w["lb_desc_input"], w["lb_status"], w["entry_radio"]])
     w["lb_save_btn"].click(
         do_save_lb_and_refresh,
         [w["lb_name_input"], w["lb_desc_input"]],
