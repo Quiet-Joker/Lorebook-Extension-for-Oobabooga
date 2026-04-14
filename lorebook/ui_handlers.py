@@ -47,6 +47,15 @@ def do_load(name):
             gr.update(choices=_entry_choices(), value=None))
 
 
+def do_reload_lb():
+    name = params.get("_st.current_lorebook", "")
+    if not name:
+        return (gr.update(), gr.update(),
+                gr.update(value="*No lorebook open — select one above or click New.*"),
+                gr.update(choices=[]))
+    return do_load(name)
+
+
 def do_new_lb():
     with _st.state_lock:
         _st.current_lorebook = {"name": "New Lorebook", "description": "", "entries": []}
