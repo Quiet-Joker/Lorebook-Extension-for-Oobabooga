@@ -44,9 +44,10 @@ params = {
 
 _MAX_GATHER_DEPTH = 20
 EXT_DIR = Path(__file__).parent
-LOREBOOKS_DIR = EXT_DIR / "lorebooks"
+LOREBOOKS_DIR  = EXT_DIR / "lorebooks"
+TEMPLATES_DIR  = EXT_DIR / "Auto Summary Prompt Templates"
 _ACTIVE_STATE_FILE = EXT_DIR / "active_state.json"
-_PARAMS_FILE = EXT_DIR / "params.json"
+_PARAMS_FILE       = EXT_DIR / "params.json"
 LOREBOOKS_DIR.mkdir(parents=True, exist_ok=True)
 
 _PARAMS_PERSIST_KEYS = {
