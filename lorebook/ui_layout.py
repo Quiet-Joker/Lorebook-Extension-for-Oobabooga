@@ -19,8 +19,7 @@ def build_layout() -> dict:
                 lb_save_btn    = gr.Button("Save",   variant="primary", elem_classes="lb-btn-primary refresh-button")
                 lb_delete_btn  = gr.Button("Delete", variant="stop",    elem_classes="lb-btn-danger refresh-button")
                 lb_refresh_btn = gr.Button("🔄",      elem_classes="refresh-button", scale=0)
-                lb_reload_btn  = gr.Button("↺ Reload", elem_classes="refresh-button", scale=0,
-                                           tooltip="Reload the current lorebook from disk, discarding unsaved changes.")
+                lb_reload_btn  = gr.Button("↺ Reload", elem_classes="refresh-button", scale=0)
 
             lb_name_input = gr.Textbox(label="Name", placeholder="My Fantasy World",
                                        info="Displayed in the active lorebooks tab.")
