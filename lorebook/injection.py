@@ -234,12 +234,14 @@ def state_modifier(state):
     except Exception:
         logger.debug("Auto-summary: capture_state_for_force failed", exc_info=True)
 
-    if params.get("auto_summary_enabled") and params.get("activate"):
+    if params.get("activate"):
         try:
-            from .summary import _ensure_summary_lorebook, _conv_key
-            char_stem, conv_id = _conv_key(state)
-            if conv_id:
-                _ensure_summary_lorebook(char_stem, conv_id)
+            from .summary import _ensure_summary_lorebook, _conv_key, _SUMMARIES_STEM
+            from .config import LOREBOOKS_DIR
+            if (LOREBOOKS_DIR / f"{_SUMMARIES_STEM}.json").exists():
+                char_stem, conv_id = _conv_key(state)
+                if conv_id:
+                    _ensure_summary_lorebook(char_stem, conv_id, create_new=False)
         except Exception:
             logger.exception("Auto-summary lorebook registration failed in state_modifier")
 
