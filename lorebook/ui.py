@@ -171,31 +171,38 @@ def ui():
     w["auto_summary_force_btn"].click(
         do_force_summary, [], [w["auto_summary_status_md"]])
 
-    # Wire summary entry switching to ooba's chat-switch event
+    def _on_chat_switch_for_summary(uid, character, mode):
+        try:
+            if not uid:
+                return
+            from .summary import _conv_key, _ensure_summary_lorebook, set_active_char_raw
+            set_active_char_raw(character or "")
+            mini_state = {
+                "unique_id":      uid,
+                "character_menu": character or "",
+                "mode":           mode if mode else "chat",
+                "history":        {},
+            }
+            char, conv_id = _conv_key(mini_state)
+            if conv_id:
+                _ensure_summary_lorebook(char, conv_id, create_new=False)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "Summary chat-switch hook failed", exc_info=True)
+
+    try:
+        from modules.chat import register_conversation_change_callback
+        register_conversation_change_callback(_on_chat_switch_for_summary)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug(
+            "Could not register conversation change callback from modules.chat",
+            exc_info=True,
+        )
+
     try:
         import modules.shared as _ms
-
-        def _on_chat_switch_for_summary(uid, character, mode):
-            try:
-                from .summary import _conv_key, _ensure_summary_lorebook, _SUMMARIES_STEM, set_active_char_raw
-                from .config import LOREBOOKS_DIR
-                set_active_char_raw(character or "")
-                if not (LOREBOOKS_DIR / f"{_SUMMARIES_STEM}.json").exists():
-                    return
-                mini_state = {
-                    "unique_id":      uid      or "",
-                    "character_menu": character or "",
-                    "mode":           mode     or "chat",
-                    "history":        {},
-                }
-                char, conv_id = _conv_key(mini_state)
-                if conv_id:
-                    _ensure_summary_lorebook(char, conv_id)
-            except Exception:
-                import logging
-                logging.getLogger(__name__).debug(
-                    "Summary chat-switch hook failed", exc_info=True)
-
         _ms.gradio['unique_id'].change(
             _on_chat_switch_for_summary,
             inputs=[
