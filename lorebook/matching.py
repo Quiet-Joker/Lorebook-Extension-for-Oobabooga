@@ -176,6 +176,8 @@ def _trim_to_budget(entries):
 
 
 def _entry_short_label(e) -> str:
+    if e.get("_sse"):
+        return "Forced Story Summary" if e.get("_gen_type") == "forced" else "Auto Story Summary"
     return (e.get("comment", "") or
             ", ".join(e.get("keys", []))[:30] or
             f"UID {e.get('uid')}")
