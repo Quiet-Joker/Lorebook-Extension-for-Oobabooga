@@ -15,9 +15,9 @@ from .storage import (
 
 logger = logging.getLogger(__name__)
 
-_AUTO_SUMMARY_LABEL   = "📖 Story Summary"
 _SUMMARIES_STEM       = "_summaries"
 _SUMMARY_ENTRY_PREFIX = "📖 Story Summary — "
+_SUMMARY_MARKER_KEY   = "_sse"
 
 _CUSTOM_BACKENDS: frozenset = frozenset({
     "LlamaServer",
@@ -205,7 +205,6 @@ def load_template(name: str):
     parts = text.split(_TEMPLATE_SEPARATOR, 1)
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
-    # Fallback: treat the whole file as the full prompt, empty delta
     return text.strip(), ""
 
 
@@ -368,79 +367,135 @@ def _apply_instruction_template(prompt: str, live_state: dict | None = None) -> 
 
 
 def _entry_comment(char_stem: str, conv_id: str) -> str:
-    return f"{_SUMMARY_ENTRY_PREFIX}{char_stem} / {conv_id}"
+    if char_stem in ("instruct", "notebook"):
+        return f"Summary - {char_stem} / {conv_id}"
+    return f"{char_stem} / {conv_id}"
 
 
-def _ensure_summary_lorebook(char_stem: str, conv_id: str) -> str:
+def _find_entry_in_lb(lb: dict, char_stem: str, conv_id: str) -> dict | None:
+    new_comment    = _entry_comment(char_stem, conv_id)
+    legacy_comment = f"{_SUMMARY_ENTRY_PREFIX}{char_stem} / {conv_id}"
+
+    for e in lb.get("entries", []):
+        if e.get("_cs") == char_stem and e.get("_ci") == conv_id:
+            if e.get("comment") != new_comment:
+                e["comment"] = new_comment
+            return e
+        if e.get("comment") == new_comment:
+            e["_cs"] = char_stem
+            e["_ci"] = conv_id
+            e[_SUMMARY_MARKER_KEY] = True
+            return e
+        if e.get("comment") == legacy_comment:
+            e["comment"]           = new_comment
+            e["_cs"]               = char_stem
+            e["_ci"]               = conv_id
+            e[_SUMMARY_MARKER_KEY] = True
+            return e
+    return None
+
+
+def _is_summary_entry(e: dict) -> bool:
+    return bool(
+        e.get(_SUMMARY_MARKER_KEY)
+        or e.get("_cs")
+        or e.get("comment", "").startswith(_SUMMARY_ENTRY_PREFIX)
+    )
+
+
+def _ensure_summary_lorebook(char_stem: str, conv_id: str,
+                              create_new: bool = False) -> str:
     global _active_summary_stem, _active_char_stem, _active_conv_id
 
-    comment = _entry_comment(char_stem, conv_id)
-    lb_path = LOREBOOKS_DIR / f"{_SUMMARIES_STEM}.json"
-
+    lb_path           = LOREBOOKS_DIR / f"{_SUMMARIES_STEM}.json"
     needs_disk        = False
     needs_save_active = False
 
     with _st.state_lock:
         lb = _st.active_lorebooks.get(_SUMMARIES_STEM)
 
+        # Drop stale cache if the file has been deleted on disk
         if lb is not None and not lb_path.exists():
             lb = None
 
         if lb is None:
-            lb = load_lorebook(_SUMMARIES_STEM) or {
-                "name":        "Auto Story Summaries",
-                "description": "Auto-managed story summaries for all conversations.",
-                "entries": [],
-            }
+            if lb_path.exists():
+                lb = load_lorebook(_SUMMARIES_STEM)
+            if lb is None:
+                if not create_new:
+                    # Nothing to sync — just update tracking variables
+                    _active_summary_stem = _SUMMARIES_STEM
+                    _active_char_stem    = char_stem
+                    _active_conv_id      = conv_id
+                    return _SUMMARIES_STEM
+                # First-ever summary: create the lorebook in memory only
+                lb = {
+                    "name":        "Auto Story Summaries",
+                    "description": "Auto-managed story summaries for all conversations.",
+                    "entries":     [],
+                }
+                needs_disk        = True
+                needs_save_active = True
             _st.active_lorebooks[_SUMMARIES_STEM] = lb
             _bump_active_version()
-            needs_save_active = True
-            needs_disk        = True
+            if not needs_save_active:
+                needs_save_active = True
 
-        found = False
+        target_entry = _find_entry_in_lb(lb, char_stem, conv_id)
+        if target_entry is not None and not target_entry.get(_SUMMARY_MARKER_KEY):
+            target_entry[_SUMMARY_MARKER_KEY] = True
+            needs_disk = True
+
         for e in lb.get("entries", []):
-            if not e.get("comment", "").startswith(_SUMMARY_ENTRY_PREFIX):
+            if e is target_entry:
                 continue
-            if e.get("comment") == comment:
-                found = True
-                if not e.get("enabled") or not e.get("constant"):
-                    e["enabled"]  = True
-                    e["constant"] = True
-                    needs_disk    = True
-            else:
-                if e.get("enabled") or e.get("constant"):
-                    e["enabled"]  = False
-                    e["constant"] = False
-                    needs_disk    = True
+            if not _is_summary_entry(e):
+                continue
+            if e.get("enabled") or e.get("constant"):
+                e["enabled"]  = False
+                e["constant"] = False
+                needs_disk    = True
 
-        if not found:
+        if target_entry is None:
+            if not create_new:
+                _active_summary_stem = _SUMMARIES_STEM
+                _active_char_stem    = char_stem
+                _active_conv_id      = conv_id
+                return _SUMMARIES_STEM
             new_uid = max(
                 (e.get("uid", 0) for e in lb.get("entries", [])), default=0
             ) + 1
-            lb["entries"].append({
-                "uid":               new_uid,
-                "enabled":           True,
-                "comment":           comment,
-                "char_stem":         char_stem,
-                "conv_id":           conv_id,
-                "keys":              [],
-                "secondary_keys":    [],
-                "selective_logic":   "AND ANY",
+            target_entry = {
+                "uid":                 new_uid,
+                "enabled":             True,
+                "comment":             _entry_comment(char_stem, conv_id),
+                "_cs":                 char_stem,
+                "_ci":                 conv_id,
+                _SUMMARY_MARKER_KEY:   True,
+                "keys":                [],
+                "secondary_keys":      [],
+                "selective_logic":     "AND ANY",
                 "content": (
                     "(Story summary not yet generated — "
                     "will appear after the first summary cycle.)"
                 ),
-                "case_sensitive":    False,
-                "match_whole_words": True,
-                "use_regex":         False,
-                "priority":          999,
-                "position":          "before_context",
-                "scan_depth":        0,
-                "probability":       100,
-                "inclusion_group":   "",
-                "constant":          True,
-            })
+                "case_sensitive":      False,
+                "match_whole_words":   True,
+                "use_regex":           False,
+                "priority":            999,
+                "position":            "before_context",
+                "scan_depth":          0,
+                "probability":         100,
+                "inclusion_group":     "",
+                "constant":            True,
+            }
+            lb["entries"].append(target_entry)
             needs_disk = True
+        else:
+            if not target_entry.get("enabled") or not target_entry.get("constant"):
+                target_entry["enabled"]  = True
+                target_entry["constant"] = True
+                needs_disk = True
 
         if needs_disk:
             _bump_active_version()
@@ -458,22 +513,19 @@ def _ensure_summary_lorebook(char_stem: str, conv_id: str) -> str:
 
 
 def _get_current_summary(char_stem: str, conv_id: str) -> str:
-    comment = _entry_comment(char_stem, conv_id)
     with _st.state_lock:
         lb = (
             _st.active_lorebooks.get(_SUMMARIES_STEM)
             or load_lorebook(_SUMMARIES_STEM)
             or {}
         )
-    for e in lb.get("entries", []):
-        if e.get("comment") == comment:
-            return e.get("content", "")
-    return ""
+    e = _find_entry_in_lb(lb, char_stem, conv_id)
+    return e.get("content", "") if e else ""
 
 
-def _update_summary_entry(char_stem: str, conv_id: str, new_content: str) -> None:
-    comment  = _entry_comment(char_stem, conv_id)
-    lb_path  = LOREBOOKS_DIR / f"{_SUMMARIES_STEM}.json"
+def _update_summary_entry(char_stem: str, conv_id: str,
+                          new_content: str, gen_type: str = "auto") -> None:
+    lb_path    = LOREBOOKS_DIR / f"{_SUMMARIES_STEM}.json"
     lb_to_save = None
 
     with _st.state_lock:
@@ -482,14 +534,18 @@ def _update_summary_entry(char_stem: str, conv_id: str, new_content: str) -> Non
             return
 
         if not lb_path.exists():
-            logger.warning("Auto-summary: _summaries.json missing — recreating from in-memory state.")
+            logger.warning(
+                "Auto-summary: _summaries.json missing — "
+                "recreating from in-memory state."
+            )
 
-        for e in lb.get("entries", []):
-            if e.get("comment") == comment:
-                e["content"] = new_content
-                _bump_active_version()
-                lb_to_save = lb
-                break
+        e = _find_entry_in_lb(lb, char_stem, conv_id)
+        if e is not None:
+            e["content"]           = new_content
+            e["_gen_type"]         = gen_type
+            e[_SUMMARY_MARKER_KEY] = True
+            _bump_active_version()
+            lb_to_save = lb
 
     if lb_to_save is not None:
         save_lorebook_file(_SUMMARIES_STEM, lb_to_save)
@@ -521,7 +577,7 @@ def _build_delta_summary_prompt(previous_summary: str,
     all_visible  = history_snapshot.get("visible",  [])
     new_internal = all_internal[last_turn:]
     new_visible  = all_visible[last_turn:]
-    max_new   = int(params.get("auto_summary_history_turns", 40))
+    max_new      = int(params.get("auto_summary_history_turns", 40))
     new_internal = new_internal[-max_new:]
     new_visible  = new_visible[-max_new:]
 
@@ -546,8 +602,20 @@ def _run_summary_inline(history_snapshot: dict,
                         char_stem: str,
                         conv_id: str,
                         force_full: bool = False,
-                        generation_state: dict | None = None) -> str:
+                        generation_state: dict | None = None,
+                        is_forced: bool = False) -> str:
     global _summary_status
+
+    if not history_snapshot.get("internal"):
+        _summary_status = (
+            "⚠ No conversation history available — "
+            "send at least one message before generating a summary."
+        )
+        logger.debug(
+            "Auto-summary skipped for %s / %s: empty history", char_stem, conv_id
+        )
+        return ""
+
     _summary_status = "⏳ Generating story summary…"
 
     csk = _conv_state_key(char_stem, conv_id)
@@ -557,7 +625,10 @@ def _run_summary_inline(history_snapshot: dict,
         last_turn = cs.get("last_turn", 0)
 
     previous_summary   = _get_current_summary(char_stem, conv_id)
-    is_placeholder     = previous_summary.startswith("(Story summary not yet")
+    is_placeholder     = (
+        not previous_summary
+        or previous_summary.startswith("(Story summary not yet")
+    )
     current_turn_count = len(history_snapshot.get("internal", []))
 
     if force_full or last_turn == 0 or is_placeholder:
@@ -709,7 +780,9 @@ def _run_summary_inline(history_snapshot: dict,
     ).strip()
 
     if summary:
-        _update_summary_entry(char_stem, conv_id, summary)
+        gen_type = "forced" if is_forced else "auto"
+        _ensure_summary_lorebook(char_stem, conv_id, create_new=True)
+        _update_summary_entry(char_stem, conv_id, summary, gen_type=gen_type)
         with _summary_lock:
             prev = _summary_char_state.setdefault(csk, {})
             prev.update({"last_turn": current_turn_count})
@@ -738,7 +811,7 @@ def should_summarise(state: dict) -> bool:
     with _last_seen_state_lock:
         _last_seen_state[csk] = copy.deepcopy(state)
 
-    _ensure_summary_lorebook(char, conv_id)
+    _ensure_summary_lorebook(char, conv_id, create_new=False)
 
     interval = max(1, int(params.get("auto_summary_interval", 2000)))
 
@@ -768,7 +841,7 @@ def run_auto_summary(state: dict) -> str:
         return ""
     history_snapshot = copy.deepcopy(state.get("history", {}))
     return _run_summary_inline(history_snapshot, char, conv_id,
-                               generation_state=state)
+                               generation_state=state, is_forced=False)
 
 
 def force_summary() -> None:
@@ -789,8 +862,6 @@ def force_summary() -> None:
             "send at least one message first."
         )
         return
-
-    _ensure_summary_lorebook(char_stem, conv_id)
 
     csk = _conv_state_key(char_stem, conv_id)
     with _summary_lock:
@@ -847,4 +918,5 @@ def force_summary() -> None:
         history_snapshot, char_stem, conv_id,
         force_full=True,
         generation_state=stored_state or None,
+        is_forced=True,
     )
