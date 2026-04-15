@@ -18,6 +18,7 @@ if _PKG not in _sys.modules:
 __package__ = _PKG
 del _sys, _types, _Path, _PKG, _DIR
 
+from . import _chat_hook  # noqa: F401
 from .config import params  # noqa: F401
 from . import summary as _summary_module  # noqa: F401
 
