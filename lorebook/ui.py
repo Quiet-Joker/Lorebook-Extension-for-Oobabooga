@@ -203,16 +203,40 @@ def ui():
 
     try:
         import modules.shared as _ms
-        _ms.gradio['unique_id'].change(
-            _on_chat_switch_for_summary,
-            inputs=[
-                _ms.gradio['unique_id'],
-                _ms.gradio['character_menu'],
-                _ms.gradio['mode'],
-            ],
-            outputs=[],
-            show_progress=False,
-        )
+
+        _uid_comp  = _ms.gradio.get("unique_id")
+        _char_comp = _ms.gradio.get("character_menu")
+        _mode_comp = _ms.gradio.get("mode")
+
+        if _uid_comp is None:
+            raise RuntimeError("unique_id not found in modules.shared.gradio")
+
+        if _mode_comp is not None and _char_comp is not None:
+            _uid_comp.change(
+                _on_chat_switch_for_summary,
+                inputs=[_uid_comp, _char_comp, _mode_comp],
+                outputs=[],
+                show_progress=False,
+            )
+        else:
+            def _on_uid_change_no_mode_comp(uid, character=""):
+                try:
+                    mode = (_ms.settings or {}).get("mode", "chat") or "chat"
+                except Exception:
+                    mode = "chat"
+                _on_chat_switch_for_summary(uid, character, mode)
+
+            inputs = [_uid_comp]
+            if _char_comp is not None:
+                inputs.append(_char_comp)
+
+            _uid_comp.change(
+                _on_uid_change_no_mode_comp,
+                inputs=inputs,
+                outputs=[],
+                show_progress=False,
+            )
+
     except Exception:
         import logging
         logging.getLogger(__name__).debug(
