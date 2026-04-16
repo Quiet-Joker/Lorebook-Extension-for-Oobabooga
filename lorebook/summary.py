@@ -884,7 +884,14 @@ def force_summary() -> None:
             import json as _json
             import modules.shared as _shared
 
-            mode = (_last_any_state or {}).get("mode", "chat")
+            mode = (_last_any_state or {}).get("mode", "")
+            if not mode:
+                if char_stem == "instruct":
+                    mode = "instruct"
+                elif char_stem == "notebook":
+                    mode = "notebook"
+                else:
+                    mode = "chat"
 
             if mode == "instruct":
                 log_path = (
