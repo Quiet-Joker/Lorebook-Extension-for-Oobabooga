@@ -18,10 +18,30 @@ def _install() -> None:
 
     _chat._conversation_change_callbacks = []
 
+    _chat._pending_conversation_change = None
+
     def register_conversation_change_callback(fn) -> None:
         _chat._conversation_change_callbacks.append(fn)
+        pending = _chat._pending_conversation_change
+        if pending:
+            _chat._pending_conversation_change = None
+            try:
+                fn(pending["uid"], pending["char"], pending["mode"])
+            except Exception:
+                logger.debug(
+                    "lorebook: replay pending conversation_change for %r raised", fn,
+                    exc_info=True,
+                )
 
     def _fire_conversation_change(unique_id: str, character: str, mode: str) -> None:
+        if not _chat._conversation_change_callbacks:
+            _chat._pending_conversation_change = {
+                "uid":  unique_id or "",
+                "char": character or "",
+                "mode": mode or "chat",
+            }
+            return
+        _chat._pending_conversation_change = None
         for cb in list(_chat._conversation_change_callbacks):
             try:
                 cb(unique_id or "", character or "", mode or "chat")
@@ -40,6 +60,8 @@ def _install() -> None:
         result = _orig_load_latest(state)
         try:
             uid = result[1] if (result and len(result) > 1) else None
+            if not uid or not isinstance(uid, str):
+                uid = state.get("unique_id", "") or ""
             if uid:
                 _chat._fire_conversation_change(
                     str(uid),
@@ -61,6 +83,8 @@ def _install() -> None:
         result = _orig_uid_select(state)
         try:
             uid = state.get("unique_id", "") or ""
+            if not uid and result and len(result) > 1 and isinstance(result[1], str):
+                uid = result[1]
             if uid:
                 _chat._fire_conversation_change(
                     str(uid),
@@ -122,7 +146,7 @@ def _install() -> None:
                     _chat._fire_conversation_change(
                         str(uid),
                         state.get("character_menu", "") or "",
-                        state.get("mode", "chat") or "chat",
+                        state.get("mode", "chat") or "",
                     )
             except Exception:
                 logger.debug(
